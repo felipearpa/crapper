@@ -208,6 +208,32 @@ def test_conftest_and_a_tests_directory_are_tests(tmp_path):
     assert iter_source_files([source]) == [source.resolve()]
 
 
+def test_dotnet_test_projects_and_fsharp_build_output_are_not_scored(tmp_path):
+    assert is_test_file("Demo.Tests/BoardTests.fs") is True
+    assert is_test_file("Demo.Test/BoardTests.fs") is True
+    assert is_test_file("Demo/Board.fs") is False
+    assert is_test_file("Demo.Tests/board.py") is False
+    files = {
+        "Demo/src/Board.fs": "module Board\nlet place x = x\n",
+        "Demo/src/obj/Debug/AssemblyInfo.fs": "module Info\nlet v = 1\n",
+        "Demo/bin/Release/Gen.fs": "module Gen\nlet g x = x\n",
+        "Demo.Tests/BoardTests.fs": "module BoardTests\nlet t x = x\n",
+        "Demo/test/Spec.fs": "module Spec\nlet s x = x\n",
+        "Demo/src/Board.fsi": "module Board\nval place: int -> int\n",
+        "crate/src/bin/tool.rs": "fn main() {}\n",
+        "Demo.Tests/helper.py": "def helper():\n    return 1\n",
+    }
+    for relative, text in files.items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    assert iter_source_files([tmp_path]) == [
+        (tmp_path / "Demo.Tests/helper.py").resolve(),
+        (tmp_path / "Demo/src/Board.fs").resolve(),
+        (tmp_path / "crate/src/bin/tool.rs").resolve(),
+    ]
+
+
 def test_missing_coverage_scores_zero_and_sorts_ahead_of_a_covered_function(tmp_path):
     low = tmp_path / "src" / "low.ts"
     high = tmp_path / "src" / "high.ts"

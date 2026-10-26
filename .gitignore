@@ -7,3 +7,6 @@ target/
 dist/
 build/
 uml-viewer-log.txt
+
+# Local plans
+/.fap/

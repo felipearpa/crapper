@@ -20,6 +20,8 @@ EXTENSIONS = {
     ".cjs": "typescript",
     ".rs": "rust",
     ".py": "python",
+    ".fs": "fsharp",
+    ".fsx": "fsharp",
 }
 
 SKIP_DIRS = {
@@ -43,6 +45,8 @@ SKIP_DIRS = {
 }
 
 TEST_DIRS = {"test", "tests", "spec", "specs", "__tests__"}
+DOTNET_TEST_DIR_SUFFIXES = (".Test", ".Tests")
+DOTNET_BUILD_DIRS = {"bin", "obj"}
 
 GO_TEST_SUFFIX = "_test.go"
 CLOJURE_TEST_SUFFIXES = ("_test.clj", "_test.cljc", "_test.cljs", "_test.bb")
@@ -87,7 +91,27 @@ def is_test_file(path: str | Path) -> bool:
         return True
     if name.endswith("_test.py") or (name.startswith("test_") and name.endswith(".py")):
         return True
-    return any(part in TEST_DIRS for part in file_path.parts)
+    if any(part in TEST_DIRS for part in file_path.parts):
+        return True
+    return _in_dotnet_test_project(file_path)
+
+
+def _fsharp_path_has(path: Path, matches) -> bool:
+    return language_of(path) == "fsharp" and any(matches(part) for part in path.parts)
+
+
+def _in_dotnet_test_project(path: Path) -> bool:
+    return _fsharp_path_has(path, lambda part: part.endswith(DOTNET_TEST_DIR_SUFFIXES))
+
+
+def _is_build_output(path: Path) -> bool:
+    return _fsharp_path_has(path, lambda part: part in DOTNET_BUILD_DIRS)
+
+
+def _is_scored(path: Path, root: Path) -> bool:
+    if language_of(path) is None or is_test_file(path):
+        return False
+    return not _is_build_output(path.relative_to(root))
 
 
 def _walk(root: Path) -> list[Path]:
@@ -102,9 +126,8 @@ def _walk(root: Path) -> list[Path]:
         ]
         for name in filenames:
             path = Path(dirpath) / name
-            if language_of(path) is None or is_test_file(path):
-                continue
-            found.append(path)
+            if _is_scored(path, root):
+                found.append(path)
     return found
 
 

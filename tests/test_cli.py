@@ -30,6 +30,12 @@ def test_language_detection():
     assert is_test_file("app.cts") is False
 
 
+def test_fsharp_sources_are_fsharp_and_signature_files_are_not_scored():
+    assert language_of("src/Board.fs") == "fsharp"
+    assert language_of("scripts/build.fsx") == "fsharp"
+    assert language_of("src/Board.fsi") is None
+
+
 def _write(root: Path, relative: str, source: str) -> None:
     path = root / relative
     path.parent.mkdir(parents=True, exist_ok=True)

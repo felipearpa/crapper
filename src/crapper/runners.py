@@ -7,13 +7,18 @@ tool, or a failed run, scores its functions at 0%.
 from __future__ import annotations
 
 import json
+import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
-from pathlib import Path
+import time
+import xml.etree.ElementTree as ET
+from pathlib import Path, PureWindowsPath
 
-from crapper.discover import is_test_file, language_of
+from crapper.coverage import normalize_path
+from crapper.discover import DOTNET_BUILD_DIRS, SKIP_DIRS, is_test_file, language_of
 
 _MAVEN = [
     "mvn",
@@ -70,7 +75,7 @@ def _clean_dir(path: Path) -> None:
         shutil.rmtree(path)
 
 
-_COVERAGE_DIRS = {"typescript", "rust", "go", "python"}
+_COVERAGE_DIRS = {"typescript", "rust", "go", "python", "fsharp"}
 
 
 def _outside_language_dirs(coverage: Path, path: Path) -> bool:
@@ -562,6 +567,183 @@ def _cover_rust(root: Path, files: list[Path]) -> None:
             _warn(f"Rust coverage exited {code} in {module}. Rust coverage will score 0%.")
 
 
+_DOTNET_PROJECTS = (".fsproj", ".csproj", ".vbproj")
+_TEST_SDK = "Microsoft.NET.Test.Sdk"
+
+
+def dotnet_test_projects(root: Path) -> list[Path]:
+    """Project files that reference Microsoft.NET.Test.Sdk, which ships the coverage collector."""
+
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            name for name in dirnames if name not in SKIP_DIRS and name not in DOTNET_BUILD_DIRS
+        ]
+        for name in filenames:
+            path = Path(dirpath) / name
+            if path.suffix in _DOTNET_PROJECTS and _TEST_SDK in _read_text(path):
+                found.append(path)
+    return sorted(found)
+
+
+def _read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def dotnet_coverage_command(project: Path, results: Path) -> list[str]:
+    return [
+        "dotnet",
+        "test",
+        str(project),
+        "--collect:Code Coverage;Format=cobertura",
+        "--results-directory",
+        str(results),
+    ]
+
+
+def _dotnet_results_dir(coverage: Path, root: Path, project: Path) -> Path:
+    slug = project.relative_to(root).with_suffix("").as_posix().replace("/", "__")
+    return coverage / slug
+
+
+_CONDITIONS = re.compile(r"\((\d+)/(\d+)\)")
+
+# Per file: line → highest hit count, and line → best (covered, total) branches.
+_FileLines = tuple[dict[int, int], dict[int, tuple[int, int]]]
+
+
+def _cobertura_key(filename: str, root: Path) -> str | None:
+    """Report path relative to `root`, so every report spells one file alike.
+
+    An absolute path outside the project, such as FSharp.Core's build paths,
+    is dropped, and so is a Windows path with a drive. A relative path is kept
+    as written.
+    """
+
+    if PureWindowsPath(filename).drive:
+        return None
+    path = Path(normalize_path(filename))
+    if not path.is_absolute():
+        return path.as_posix()
+    for candidate in (path, path.resolve()):
+        try:
+            return candidate.relative_to(root).as_posix()
+        except ValueError:
+            continue
+    return None
+
+
+def _condition_coverage(line) -> tuple[int, int] | None:
+    if line.get("branch", "").lower() != "true":
+        return None
+    found = _CONDITIONS.search(line.get("condition-coverage") or "")
+    if found is None:
+        return None
+    return int(found.group(1)), int(found.group(2))
+
+
+def _best(current: tuple[int, int] | None, entry: tuple[int, int]) -> tuple[int, int]:
+    if current is None:
+        return entry
+    return (max(current[0], entry[0]), max(current[1], entry[1]))
+
+
+def _read_cobertura_class(record: _FileLines, class_node) -> None:
+    lines, branches = record
+    for line in class_node.iter("line"):
+        number = int(line.get("number") or "0")
+        lines[number] = max(lines.get(number, 0), int(line.get("hits") or "0"))
+        entry = _condition_coverage(line)
+        if entry is not None:
+            branches[number] = _best(branches.get(number), entry)
+
+
+def _cobertura_reports(coverage: Path, since: float | None):
+    for path in sorted(coverage.rglob("*.cobertura.xml")):
+        if since is not None and path.stat().st_mtime < since:
+            continue
+        try:
+            yield ET.parse(path).getroot()
+        except ET.ParseError as exc:
+            _warn(f"{path}: unreadable Cobertura report ({exc}); skipped.")
+
+
+def _combine_cobertura(coverage: Path, root: Path, since: float | None) -> dict[str, _FileLines]:
+    combined: dict[str, _FileLines] = {}
+    for report in _cobertura_reports(coverage, since):
+        for class_node in report.iter("class"):
+            key = _cobertura_key(class_node.get("filename", ""), root)
+            if key is not None:
+                _read_cobertura_class(combined.setdefault(key, ({}, {})), class_node)
+    return combined
+
+
+def _lcov_record(key: str, record: _FileLines) -> str:
+    lines, branches = record
+    out = [f"SF:{key}"]
+    out.extend(f"DA:{number},{hits}" for number, hits in sorted(lines.items()))
+    for number, (covered, total) in sorted(branches.items()):
+        out.extend(
+            f"BRDA:{number},0,{index},{1 if index < covered else 0}" for index in range(total)
+        )
+    out.append("end_of_record")
+    return "\n".join(out) + "\n"
+
+
+def _written_since(path: Path, since: float | None) -> bool:
+    return since is not None and path.is_file() and path.stat().st_mtime >= since
+
+
+def write_fsharp_lcov(root: Path, since: float | None = None) -> None:
+    """Combine the Cobertura reports into `target/coverage/fsharp/lcov.info`.
+
+    Reports of one file merge line by line: a line is covered when any report
+    covered it, and its branches keep the highest covered count. Cobertura gives
+    only a count per line, so two reports that took different branches of one
+    line under-count it. Each line's (covered, total) is written as `total`
+    BRDA records, `covered` of them taken. With `since`, only reports modified
+    at or after that time are read; None reads them all. An `lcov.info` from an
+    earlier run is removed first; one written since `since` came from the user's
+    command and is kept unconverted. The Cobertura reports are never removed.
+    """
+
+    coverage = root / "target" / "coverage" / "fsharp"
+    lcov = coverage / "lcov.info"
+    if _written_since(lcov, since):
+        return
+    lcov.unlink(missing_ok=True)
+    combined = _combine_cobertura(coverage, root.resolve(), since)
+    if not combined:
+        return
+    text = "".join(_lcov_record(key, record) for key, record in sorted(combined.items()))
+    lcov.write_text(text, encoding="utf-8")
+
+
+def _cover_fsharp(root: Path) -> None:
+    """Run each .NET test project; old reports go first, so a skipped run scores 0%."""
+
+    coverage = root / "target" / "coverage" / "fsharp"
+    _clean_dir(coverage)
+    if not shutil.which("dotnet"):
+        _warn("dotnet is not installed. F# coverage will score 0%.")
+        return
+    projects = dotnet_test_projects(root)
+    if not projects:
+        _warn("No .NET test project references Microsoft.NET.Test.Sdk; skipping F# coverage.")
+        return
+    for project in projects:
+        results = _dotnet_results_dir(coverage, root, project)
+        results.mkdir(parents=True, exist_ok=True)
+        code = run_shell(dotnet_coverage_command(project, results), project.parent)
+        if code == 0:
+            continue
+        if any(results.rglob("*.cobertura.xml")):
+            _warn(f"F# tests exited {code} in {project}. Coverage was still recorded.")
+        else:
+            _warn(f"F# coverage exited {code} in {project}. F# coverage will score 0%.")
+    write_fsharp_lcov(root)
+
+
 def run_coverage(root: Path, files: list[Path], command: str | None) -> int:
     """Generate coverage reports for the languages present in `files`.
 
@@ -572,12 +754,17 @@ def run_coverage(root: Path, files: list[Path], command: str | None) -> int:
 
     root = root.resolve()
     if command:
+        # `dotnet test` adds a new folder per run, so only this run's reports
+        # count. Whole seconds, since some file systems store coarse times.
+        start = float(int(time.time()))
         code = run_shell(command, root)
         if code != 0:
             _warn(
                 f"Coverage command exited {code}. "
                 "Reports already on disk will not be read."
             )
+            return code
+        write_fsharp_lcov(root, since=start)
         return code
 
     languages = _languages_in(files)
@@ -593,4 +780,6 @@ def run_coverage(root: Path, files: list[Path], command: str | None) -> int:
         _cover_python(root, files)
     if "rust" in languages:
         _cover_rust(root, files)
+    if "fsharp" in languages:
+        _cover_fsharp(root)
     return 0
