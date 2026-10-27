@@ -225,6 +225,7 @@ def test_parse_args_reads_the_process_arguments_after_the_program(monkeypatch):
 def test_flags_that_only_store_a_boolean():
     assert parse_args(["--use-existing-coverage"]).use_existing_coverage is True
     assert parse_args(["--changed"]).changed is True
+    assert parse_args(["--changed-functions"]).changed_functions is True
     assert parse_args(["--no-coverage"]).no_coverage is True
     conflict = parse_args(["--no-coverage", "--coverage-command", "true"])
     assert conflict.exit_code == 1
@@ -405,3 +406,78 @@ def test_main_exits_with_the_status(monkeypatch):
         assert exc.code == 4
     else:
         raise AssertionError("main did not exit")
+
+
+def _repo(root: Path) -> list[str]:
+    git = ["git", "-C", str(root)]
+    subprocess.run([*git, "init"], check=True, capture_output=True)
+    subprocess.run([*git, "config", "user.email", "t@example.com"], check=True)
+    subprocess.run([*git, "config", "user.name", "t"], check=True)
+    return git
+
+
+def _repo_with_one_edited_function(root: Path, relative: str = "app.py") -> list[str]:
+    git = _repo(root)
+    source = root / relative
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(
+        "def edited(x):\n    return x\n\n\ndef untouched(x):\n    return x\n",
+        encoding="utf-8",
+    )
+    subprocess.run([*git, "add", "."], check=True)
+    subprocess.run([*git, "commit", "-m", "init"], check=True, capture_output=True)
+    source.write_text(
+        "def edited(x):\n    if x:\n        return 1\n    return x\n\n\ndef untouched(x):\n    return x\n",
+        encoding="utf-8",
+    )
+    return git
+
+
+def test_changed_functions_reports_only_the_functions_an_edit_touched(tmp_path, capsys):
+    _repo_with_one_edited_function(tmp_path)
+
+    assert run(["--root", str(tmp_path), "--no-coverage", "--changed-functions"]) == 0
+    table = capsys.readouterr().out
+    assert "edited" in table
+    assert "untouched" not in table
+    snapshot = (tmp_path / ".metrics" / "crap.edn").read_text(encoding="utf-8")
+    assert ':name "edited"' in snapshot
+    assert ':name "untouched"' in snapshot
+
+
+def test_changed_still_reports_every_function_of_an_edited_file(tmp_path, capsys):
+    _repo_with_one_edited_function(tmp_path)
+
+    assert run(["--root", str(tmp_path), "--no-coverage", "--changed"]) == 0
+    out = capsys.readouterr().out
+    assert "edited" in out
+    assert "untouched" in out
+
+
+def test_changed_functions_reports_an_edited_function_in_a_file_whose_name_has_a_space(tmp_path, capsys):
+    _repo_with_one_edited_function(tmp_path, "my app.py")
+
+    assert run(["--root", str(tmp_path), "--no-coverage", "--changed-functions"]) == 0
+    assert "edited" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("setting", ["diff.mnemonicPrefix", "diff.relative"])
+def test_changed_functions_ignores_diff_settings_that_rewrite_paths(tmp_path, capsys, setting):
+    git = _repo_with_one_edited_function(tmp_path, "sub/app.py")
+    subprocess.run([*git, "config", setting, "true"], check=True)
+
+    assert run(["--root", str(tmp_path / "sub"), "--no-coverage", "--changed-functions"]) == 0
+    assert "edited" in capsys.readouterr().out
+
+
+def test_changed_functions_reports_nothing_for_an_edit_outside_every_function(tmp_path, capsys):
+    git = _repo(tmp_path)
+    source = tmp_path / "app.py"
+    source.write_text("def kept(x):\n    return x\n", encoding="utf-8")
+    subprocess.run([*git, "add", "."], check=True)
+    subprocess.run([*git, "commit", "-m", "init"], check=True, capture_output=True)
+    source.write_text("def kept(x):\n    return x\n\n\n# note\n", encoding="utf-8")
+
+    assert run(["--root", str(tmp_path), "--no-coverage", "--changed-functions"]) == 0
+    assert "kept" not in capsys.readouterr().out
+    assert ':name "kept"' in (tmp_path / ".metrics" / "crap.edn").read_text(encoding="utf-8")

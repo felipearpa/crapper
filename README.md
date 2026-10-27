@@ -28,9 +28,12 @@ The first run creates `.venv` and installs the tool. From a project root it walk
 ./crapper --use-existing-coverage        # read reports already on disk
 ./crapper src/demo/core.clj src/ui       # these files and trees
 ./crapper --changed                      # git additions and edits
+./crapper --changed-functions            # only the functions those edits touched
 ./crapper combat                         # path fragment, same idea as crap4clj
 ./crapper --threshold 30                 # exit 2 when the worst score is higher
 ```
+
+`--changed-functions` analyzes the same files as `--changed`, then intersects each function's line range with the hunks of `git diff -U0 HEAD`, and counts every line of an untracked file. The table shows only the functions that overlap a changed line, and `--threshold` judges only those. `.metrics/crap.edn` still holds every function of the changed files, so uml-viewer sees whole files. Before the first commit, every changed file counts as wholly changed. A function whose coverage dropped because only a test file changed is not detected: no line of it changed.
 
 ## Snapshot
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import codecs
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -21,6 +23,7 @@ from crapper.discover import (
     language_of,
 )
 from crapper.metrics import write_metrics
+from crapper.model import Entry
 from crapper.report import format_report
 from crapper.runners import run_coverage
 
@@ -56,6 +59,11 @@ Options:
                                 May be repeated.
   --changed                     Analyze added and modified source files from
                                 git status.
+  --changed-functions           Analyze the same files as --changed, but report
+                                only the functions that overlap a line of
+                                `git diff HEAD` or an untracked file.
+                                .metrics/crap.edn keeps every function of
+                                those files.
   --no-coverage                 Score complexity only. Coverage and CRAP are N/A.
   --use-existing-coverage       Read coverage already on disk. Do not rerun tests.
   --coverage-command <cmd>      Run this command instead of the per-language
@@ -106,12 +114,62 @@ class Options:
     coverage_command: str | None = None
     threshold: float | None = None
     changed: bool = False
+    changed_functions: bool = False
 
 
 def _take(args: list[str], index: int, option: str) -> str:
     if index + 1 >= len(args) or not args[index + 1] or args[index + 1].startswith("-"):
         raise ValueError(f"{option} requires a value")
     return args[index + 1]
+
+
+def _number(kind, noun: str):
+    def convert(raw: str, option: str):
+        try:
+            return kind(raw)
+        except ValueError as exc:
+            raise ValueError(f"{option} requires {noun}") from exc
+
+    return convert
+
+
+_FLAGS = {
+    "--no-coverage": "no_coverage",
+    "--use-existing-coverage": "use_existing_coverage",
+    "--changed": "changed",
+    "--changed-functions": "changed_functions",
+}
+
+_VALUES = {
+    "--root": ("project_root", lambda raw, _option: Path(raw)),
+    "--coverage-command": ("coverage_command", lambda raw, _option: raw),
+    "--threshold": ("threshold", _number(float, "a number")),
+}
+
+def _read_option(options: Options, args: list[str], index: int) -> int:
+    """Apply the option at `index` to `options` and return the next index."""
+
+    arg = args[index]
+    if arg in _FLAGS:
+        setattr(options, _FLAGS[arg], True)
+        return index + 1
+    if arg in {"-s", "--source-root"}:
+        options.source_roots.append(_take(args, index, arg))
+        return index + 2
+    if arg in _VALUES:
+        name, convert = _VALUES[arg]
+        setattr(options, name, convert(_take(args, index, arg), arg))
+        return index + 2
+    if arg.startswith("-"):
+        raise ValueError(f"Unknown option: {arg}")
+    options.positionals.append(arg)
+    return index + 1
+
+
+def _conflict(options: Options) -> str | None:
+    if options.no_coverage and options.coverage_command:
+        return "--no-coverage cannot be combined with --coverage-command"
+    return None
 
 
 def parse_args(argv: list[str] | None = None) -> Options:
@@ -122,51 +180,12 @@ def parse_args(argv: list[str] | None = None) -> Options:
     index = 0
     try:
         while index < len(args):
-            arg = args[index]
-            if arg in {"-s", "--source-root"}:
-                options.source_roots.append(_take(args, index, arg))
-                index += 2
-                continue
-            if arg == "--root":
-                options.project_root = Path(_take(args, index, arg))
-                index += 2
-                continue
-            if arg == "--coverage-command":
-                options.coverage_command = _take(args, index, arg)
-                index += 2
-                continue
-            if arg == "--threshold":
-                raw = _take(args, index, arg)
-                try:
-                    options.threshold = float(raw)
-                except ValueError as exc:
-                    raise ValueError("--threshold requires a number") from exc
-                index += 2
-                continue
-            if arg == "--no-coverage":
-                options.no_coverage = True
-                index += 1
-                continue
-            if arg == "--use-existing-coverage":
-                options.use_existing_coverage = True
-                index += 1
-                continue
-            if arg == "--changed":
-                options.changed = True
-                index += 1
-                continue
-            if arg.startswith("-"):
-                raise ValueError(f"Unknown option: {arg}")
-            options.positionals.append(arg)
-            index += 1
+            index = _read_option(options, args, index)
     except ValueError as exc:
         return Options(action="help", message=f"{exc}\n\n{HELP}", exit_code=1)
-    if options.no_coverage and options.coverage_command:
-        return Options(
-            action="help",
-            message=f"--no-coverage cannot be combined with --coverage-command\n\n{HELP}",
-            exit_code=1,
-        )
+    conflict = _conflict(options)
+    if conflict:
+        return Options(action="help", message=f"{conflict}\n\n{HELP}", exit_code=1)
     return options
 
 
@@ -189,7 +208,14 @@ def _git(root: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
 
 
 def _changed_files(root: Path) -> list[Path]:
-    """Added and modified files from git, including files in new directories.
+    """Added and modified files from git, including files in new directories."""
+
+    _top, found = _status(root)
+    return [path for _code, path in found]
+
+
+def _status(root: Path) -> tuple[Path, list[tuple[str, Path]]]:
+    """The repository top, and each changed file under `root` with its status code.
 
     Paths come from `git status -z`, which does not quote non-ASCII names.
     They are resolved from the repository root, then limited to `root`, so
@@ -215,14 +241,110 @@ def _changed_files(root: Path) -> list[Path]:
         raise GitError(status.returncode, status.stderr.strip() or "git status failed")
     top = Path(top_result.stdout.strip())
     limit = root.resolve()
-    found: list[Path] = []
+    found: list[tuple[str, Path]] = []
     for entry in status.stdout.split("\0"):
         if len(entry) < 4:
             continue
         path = (top / entry[3:]).resolve()
         if path.is_file() and path.is_relative_to(limit):
-            found.append(path)
-    return found
+            found.append((entry[:2], path))
+    return top, found
+
+
+_HUNK = re.compile(r"@@ -\S+ \+(\d+)(?:,(\d+))? @@")
+
+# A changed file's touched lines. None means every line: an untracked file.
+ChangedLines = dict[Path, set[int] | None]
+
+
+def _diff_path(header: str) -> str | None:
+    """The new-side path of a `+++ ` header, or None for a deleted file.
+
+    git ends the header with a tab when the name holds a space.
+    """
+
+    name = header[4:].rstrip("\t")
+    if name == "/dev/null":
+        return None
+    if name.startswith('"') and name.endswith('"'):
+        name = codecs.escape_decode(name[1:-1].encode("utf-8"))[0].decode("utf-8")
+    return name[2:] if name.startswith("b/") else name
+
+
+def _hunk_lines(line: str) -> range:
+    """New-side lines of one `-U0` hunk. A pure deletion touches the line above it."""
+
+    match = _HUNK.match(line)
+    if match is None:
+        return range(0)
+    start = int(match.group(1))
+    count = 1 if match.group(2) is None else int(match.group(2))
+    if count == 0:
+        return range(max(start, 1), max(start, 1) + 1)
+    return range(start, start + count)
+
+
+def _parse_diff(top: Path, text: str, changes: ChangedLines) -> None:
+    current: Path | None = None
+    in_header = False
+    for line in text.splitlines():
+        if line.startswith("diff --git "):
+            in_header, current = True, None
+        elif in_header and line.startswith("+++ "):
+            name = _diff_path(line)
+            current = None if name is None else (top / name).resolve()
+        elif line.startswith("@@"):
+            in_header = False
+            if current is not None and changes.get(current, set()) is not None:
+                changes.setdefault(current, set()).update(_hunk_lines(line))
+
+
+def _changed_lines(root: Path) -> ChangedLines:
+    """Lines changed since HEAD, from `git diff -U0 HEAD`, plus whole untracked files.
+
+    Before the first commit every changed file counts as wholly changed.
+    """
+
+    top, found = _status(root)
+    if _git(root, ["rev-parse", "--verify", "--quiet", "HEAD"]).returncode != 0:
+        return {path: None for _code, path in found}
+    changes: ChangedLines = {path: None for code, path in found if code == "??"}
+    diff = _git(
+        root,
+        [
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "-U0",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-renames",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--no-relative",
+            "HEAD",
+            "--",
+            ".",
+        ],
+    )
+    if diff.returncode != 0:
+        raise GitError(diff.returncode, diff.stderr.strip() or "git diff failed")
+    _parse_diff(top, diff.stdout, changes)
+    return changes
+
+
+def touched_entries(entries: list[Entry], root: Path, changes: ChangedLines) -> list[Entry]:
+    """Entries whose line range overlaps a changed line, in their original order."""
+
+    kept: list[Entry] = []
+    for entry in entries:
+        path = (root / entry.path).resolve()
+        if path not in changes:
+            continue
+        lines = changes[path]
+        if lines is None or any(entry.start_line <= line <= entry.end_line for line in lines):
+            kept.append(entry)
+    return kept
 
 
 def _positionals(root: Path, args: list[str]) -> tuple[list[Path], list[str]]:
@@ -258,7 +380,7 @@ def _explicit_files(existing: list[Path]) -> list[Path]:
 
 
 def _selected(options: Options, root: Path, existing: list[Path]) -> list[Path]:
-    if options.changed:
+    if options.changed or options.changed_functions:
         return _changed_source(root)
     if options.source_roots:
         return iter_source_files([(root / path).resolve() for path in options.source_roots])
@@ -318,6 +440,7 @@ def run(argv: list[str] | None = None) -> int:
     root = options.project_root.resolve()
     try:
         files = select_files(options)
+        changes = _changed_lines(root) if options.changed_functions and files else None
     except GitError as exc:
         print(str(exc), file=sys.stderr)
         return exc.code
@@ -327,9 +450,10 @@ def run(argv: list[str] | None = None) -> int:
 
     entries = analyze_files(files, root, _coverage_bundle(options, root, files))
     metrics = write_metrics(entries, root)
-    print(format_report(entries), end="", flush=True)
+    shown = entries if changes is None else touched_entries(entries, root, changes)
+    print(format_report(shown), end="", flush=True)
     print(f"Wrote {metrics}", file=sys.stderr)
-    return _threshold_status(options, entries)
+    return _threshold_status(options, shown)
 
 
 def main(argv: list[str] | None = None) -> None:

@@ -30,3 +30,7 @@ class Entry:
     crap: float | None
     path: str
     language: str
+    # Source lines of the function, 1-based and inclusive. 0 when unknown.
+    # `--changed` keeps the rows whose range overlaps a changed line.
+    start_line: int = 0
+    end_line: int = 0
