@@ -1,5 +1,4 @@
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -7,7 +6,6 @@ import pytest
 from crapper.analyze import analyze_files
 from crapper.coverage import load_bundle
 from crapper.discover import is_test_file
-from crapper.model import Function
 from crapper.runners import (
     PackageJsonError,
     _clean_clojure,
@@ -33,10 +31,7 @@ from crapper.runners import (
     typescript_command,
     typescript_packages,
     uses_pytest,
-    write_fsharp_lcov,
 )
-
-from conftest import cobertura
 
 
 def _as_text(command) -> str:
@@ -560,6 +555,17 @@ _TEST_SDK = '<Project><ItemGroup><PackageReference Include="Microsoft.NET.Test.S
 _COLLECT = "--collect:Code Coverage;Format=cobertura"
 
 
+def _cobertura(filename, lines):
+    """One Cobertura report with one class; `lines` are (number, hits) pairs."""
+
+    rows = "".join(f'<line number="{number}" hits="{hits}" branch="False" />' for number, hits in lines)
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n<coverage><packages><package name="Demo">'
+        f'<classes><class name="Demo.Board" filename="{filename}"><methods/><lines>{rows}</lines>'
+        "</class></classes></package></packages></coverage>"
+    )
+
+
 def _dotnet_solution(root: Path) -> Path:
     source = _write(root, "Board/src/Board.fs", "module Board\n\nlet place x = x + 1\n")
     _write(root, "Board/src/Board.fsproj", "<Project></Project>\n")
@@ -616,7 +622,7 @@ def test_missing_dotnet_warns_and_scores_fsharp_at_zero_even_with_an_old_report(
     _write(
         tmp_path / "target" / "coverage" / "fsharp",
         "Board__test__Board.Test/old/r.cobertura.xml",
-        cobertura(source.resolve(), [(3, 2, None)]),
+        _cobertura(source.resolve(), [(3, 2)]),
     )
     commands = _fake_dotnet(monkeypatch)
     monkeypatch.setattr("crapper.runners.shutil.which", lambda name: None)
@@ -629,7 +635,7 @@ def test_missing_dotnet_warns_and_scores_fsharp_at_zero_even_with_an_old_report(
 
 def test_a_failed_test_run_that_wrote_a_report_keeps_its_coverage_with_a_warning(tmp_path, monkeypatch, capsys):
     source = _dotnet_solution(tmp_path)
-    report = cobertura(source.resolve(), [(3, 2, None)])
+    report = _cobertura(source.resolve(), [(3, 2)])
     _fake_dotnet(monkeypatch, code=1, report=report)
     run_coverage(tmp_path, [source], None)
     assert "F# tests exited 1 in" in capsys.readouterr().err
@@ -658,142 +664,3 @@ def test_a_symlinked_test_project_never_stops_the_snapshot(tmp_path, monkeypatch
     assert [command[2] for command, _cwd in commands] == [str(linked)]
     found = analyze_files([source], root, load_bundle(root))
     assert [(entry.name, entry.coverage) for entry in found] == [("place", 0.0)]
-
-
-def _write_cobertura(root, project, text):
-    _write(root / "target" / "coverage" / "fsharp" / project, "4f2c/me_host_2026.cobertura.xml", text)
-
-
-def _fsharp_percent(root, start_line, end_line, path="src/Board.fs"):
-    function = Function(
-        name="choose",
-        namespace="Demo.Board",
-        complexity=2,
-        start_line=start_line,
-        end_line=end_line,
-        path=path,
-        language="fsharp",
-    )
-    return load_bundle(root).percent_for(function)
-
-
-def test_cobertura_condition_coverage_scores_a_function_and_line_hits_score_a_branchless_one(tmp_path):
-    source = tmp_path / "src" / "Board.fs"
-    _write_cobertura(
-        tmp_path,
-        "Board.Tests",
-        cobertura(source, [(3, 4, None), (4, 1, "1/2"), (5, 0, None), (8, 2, None), (9, 0, None)]),
-    )
-    write_fsharp_lcov(tmp_path)
-    assert _fsharp_percent(tmp_path, 3, 5) == 50.0
-    assert _fsharp_percent(tmp_path, 8, 9) == 50.0
-
-
-def test_the_same_fsharp_file_in_two_cobertura_reports_merges_in_either_load_order(tmp_path):
-    reports = [
-        [(3, 0, None), (4, 0, "0/2")],
-        [(3, 35, None), (4, 2, "2/2")],
-    ]
-    for name, order in (("ab", reports), ("ba", reports[::-1])):
-        root = tmp_path / name
-        source = root / "src" / "Board.fs"
-        _write_cobertura(root, "One.Tests", cobertura(source, order[0]))
-        _write_cobertura(root, "Two.Tests", cobertura(source, order[1]))
-        write_fsharp_lcov(root)
-        assert _fsharp_percent(root, 3, 3) == 100.0
-        assert _fsharp_percent(root, 3, 4) == 100.0
-
-
-def test_branches_on_a_line_take_the_highest_covered_count_any_report_gives(tmp_path):
-    source = tmp_path / "src" / "Board.fs"
-    _write_cobertura(tmp_path, "One.Tests", cobertura(source, [(4, 1, "1/4")]))
-    _write_cobertura(tmp_path, "Two.Tests", cobertura(source, [(4, 1, "3/4")]))
-    write_fsharp_lcov(tmp_path)
-    assert _fsharp_percent(tmp_path, 4, 4) == 75.0
-
-
-def test_a_line_listed_under_two_classes_of_one_report_merges_like_two_reports(tmp_path):
-    source = tmp_path / "src" / "Board.fs"
-    first = cobertura(source, [(3, 0, "0/2")], name="Demo.Board")
-    second = cobertura(source, [(3, 1, "1/2")], name="Demo.Board/choose@3")
-    classes = first.split("<classes>")[1].split("</classes>")[0]
-    _write_cobertura(tmp_path, "Board.Tests", second.replace("<classes>", "<classes>" + classes))
-    write_fsharp_lcov(tmp_path)
-    assert _fsharp_percent(tmp_path, 3, 3) == 50.0
-
-
-def test_a_file_outside_the_project_such_as_fsharp_core_matches_no_entry(tmp_path):
-    outside = "/Users/runner/work/1/s/src/fsharp/src/FSharp.Core/array.fs"
-    _write_cobertura(tmp_path, "Board.Tests", cobertura(outside, [(3, 5, None)]))
-    write_fsharp_lcov(tmp_path)
-    assert _fsharp_percent(tmp_path, 3, 3, path="array.fs") is None
-    assert _fsharp_percent(tmp_path, 3, 3, path="FSharp.Core/array.fs") is None
-
-
-def test_a_windows_path_fsharp_core_file_in_a_report_matches_no_project_entry(tmp_path):
-    outside = "D:\\a\\_work\\1\\s\\src\\FSharp.Core\\array.fs"
-    _write_cobertura(tmp_path, "Board.Tests", cobertura(outside, [(3, 5, None)]))
-    write_fsharp_lcov(tmp_path)
-    assert _fsharp_percent(tmp_path, 3, 3, path="src/FSharp.Core/array.fs") is None
-    assert _fsharp_percent(tmp_path, 3, 3, path="FSharp.Core/array.fs") is None
-
-
-def test_an_unreadable_cobertura_report_is_skipped_with_a_warning(tmp_path, capsys):
-    source = tmp_path / "src" / "Board.fs"
-    _write_cobertura(tmp_path, "Broken.Tests", "<coverage><packages>")
-    _write_cobertura(tmp_path, "Board.Tests", cobertura(source, [(3, 1, None)]))
-    write_fsharp_lcov(tmp_path)
-    assert "unreadable Cobertura report" in capsys.readouterr().err
-    assert _fsharp_percent(tmp_path, 3, 3) == 100.0
-
-
-def test_a_custom_coverage_command_that_writes_cobertura_gives_fsharp_its_coverage(tmp_path, monkeypatch):
-    source = _write(tmp_path, "src/Board.fs", "module Board\n\nlet place x = x + 1\n")
-
-    def shell(command, cwd):
-        _write_cobertura(cwd, "Board.Tests", cobertura(source.resolve(), [(3, 2, None)]))
-        return 0
-
-    monkeypatch.setattr("crapper.runners.run_shell", shell)
-    assert run_coverage(tmp_path, [source], "dotnet test --collect:'Code Coverage;Format=cobertura'") == 0
-    found = analyze_files([source], tmp_path, load_bundle(tmp_path))
-    assert [(entry.name, entry.coverage) for entry in found] == [("place", 100.0)]
-
-
-def test_a_report_from_an_earlier_run_does_not_raise_coverage_after_a_custom_command(tmp_path, monkeypatch):
-    source = _write(tmp_path, "src/Board.fs", "module Board\n\nlet place x = x + 1\n")
-    _write_cobertura(tmp_path, "Old.Tests", cobertura(source.resolve(), [(3, 2, None)]))
-    old = next((tmp_path / "target" / "coverage" / "fsharp" / "Old.Tests").rglob("*.cobertura.xml"))
-    os.utime(old, (1_000_000_000, 1_000_000_000))
-
-    def shell(command, cwd):
-        _write_cobertura(cwd, "Board.Tests", cobertura(source.resolve(), [(3, 0, None)]))
-        return 0
-
-    monkeypatch.setattr("crapper.runners.run_shell", shell)
-    assert run_coverage(tmp_path, [source], "dotnet test --collect:'Code Coverage;Format=cobertura'") == 0
-    found = analyze_files([source], tmp_path, load_bundle(tmp_path))
-    assert [(entry.name, entry.coverage) for entry in found] == [("place", 0.0)]
-
-
-def test_an_lcov_file_from_an_earlier_run_does_not_raise_coverage_after_a_custom_command(tmp_path, monkeypatch):
-    source = _write(tmp_path, "src/Board.fs", "module Board\n\nlet place x = x + 1\n")
-    old = _write(tmp_path, "target/coverage/fsharp/lcov.info", "SF:src/Board.fs\nDA:3,2\nend_of_record\n")
-    os.utime(old, (1_000_000_000, 1_000_000_000))
-    monkeypatch.setattr("crapper.runners.run_shell", lambda command, cwd: 0)
-    assert run_coverage(tmp_path, [source], "dotnet test --collect:'Code Coverage;Format=cobertura'") == 0
-    found = analyze_files([source], tmp_path, load_bundle(tmp_path))
-    assert [(entry.name, entry.coverage) for entry in found] == [("place", 0.0)]
-
-
-def test_an_lcov_file_written_by_the_coverage_command_is_kept_and_scored(tmp_path, monkeypatch):
-    source = _write(tmp_path, "src/Board.fs", "module Board\n\nlet place x = x + 1\n")
-
-    def shell(command, cwd):
-        _write(cwd, "target/coverage/fsharp/lcov.info", "SF:src/Board.fs\nDA:3,2\nend_of_record\n")
-        return 0
-
-    monkeypatch.setattr("crapper.runners.run_shell", shell)
-    assert run_coverage(tmp_path, [source], "dotnet test --collect:'XPlat Code Coverage;Format=lcov'") == 0
-    found = analyze_files([source], tmp_path, load_bundle(tmp_path))
-    assert [(entry.name, entry.coverage) for entry in found] == [("place", 100.0)]

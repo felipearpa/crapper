@@ -1,9 +1,4 @@
-from crapper.analyze import analyze_files
-from crapper.coverage import load_bundle
 from crapper.languages.fsharp import functions_in_source
-from crapper.runners import write_fsharp_lcov
-
-from conftest import cobertura
 
 
 def entries(source, path="src/Board.fs"):
@@ -305,21 +300,4 @@ type Holder() =
         ("Demo.Resources", "disposable", 2),
         ("Demo.Resources.Holder", "comparer", 3),
         ("Demo.Resources.Holder", "Comparer", 1),
-    ]
-
-
-def test_a_script_function_no_coverage_report_mentions_scores_zero(tmp_path):
-    board = tmp_path / "src" / "Board.fs"
-    board.parent.mkdir(parents=True)
-    board.write_text("module Board\n\nlet place x = x + 1\n", encoding="utf-8")
-    script = tmp_path / "build.fsx"
-    script.write_text("let publish target = target\n", encoding="utf-8")
-    report = tmp_path / "target" / "coverage" / "fsharp" / "Board.Tests" / "run" / "r.cobertura.xml"
-    report.parent.mkdir(parents=True)
-    report.write_text(cobertura(board.resolve(), [(3, 1, None)]), encoding="utf-8")
-    write_fsharp_lcov(tmp_path)
-    found = analyze_files([board, script], tmp_path, load_bundle(tmp_path))
-    assert sorted((entry.name, entry.coverage) for entry in found) == [
-        ("place", 100.0),
-        ("publish", 0.0),
     ]

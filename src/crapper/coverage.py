@@ -1,17 +1,19 @@
-"""Load Cloverage, LCOV, JaCoCo, and Go coverage profiles.
+"""Load Cloverage, LCOV, Cobertura, JaCoCo, and Go coverage profiles.
 
 Clojure prefers Cloverage's per-line form counts, then LCOV. Java uses JaCoCo
-instruction counters. Go uses statement profiles. LCOV scores a function by
-its BRDA branch records when it has any, and by line hits otherwise.
+instruction counters. Go uses statement profiles. Cobertura reports join the
+LCOV index. LCOV scores a function by its BRDA branch records when it has any,
+and by line hits otherwise.
 `percent_for` returns None when the file is absent; analysis turns that into 0%.
 """
 
 from __future__ import annotations
 
 import re
+import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from urllib.parse import unquote
 
 from crapper.model import Function
@@ -22,6 +24,7 @@ _SPAN = re.compile(
 _LCOV_DA = re.compile(r"DA:(\d+),(\d+)")
 _LCOV_BRDA = re.compile(r"BRDA:(\d+),([^,]*),([^,]*),(-|\d+)")
 _DOCTYPE = re.compile(r"<!DOCTYPE[^>]*>", re.IGNORECASE)
+_CONDITIONS = re.compile(r"\((\d+)/(\d+)\)")
 
 
 class FileCoverage(dict):
@@ -350,6 +353,64 @@ def go_percent(
     return coverage_percent(covered, total)
 
 
+def _cobertura_key(filename: str, root: Path) -> str | None:
+    """Report path relative to `root`, so every report spells one file alike.
+
+    An absolute path outside the project, such as FSharp.Core's build paths,
+    is dropped, and so is a Windows path with a drive. A relative path is kept
+    as written.
+    """
+
+    if PureWindowsPath(filename).drive:
+        return None
+    path = Path(normalize_path(filename))
+    if not path.is_absolute():
+        return path.as_posix()
+    for candidate in (path, path.resolve()):
+        try:
+            return candidate.relative_to(root).as_posix()
+        except ValueError:
+            continue
+    return None
+
+
+def _condition_coverage(line) -> tuple[int, int] | None:
+    if line.get("branch", "").lower() != "true":
+        return None
+    found = _CONDITIONS.search(line.get("condition-coverage") or "")
+    if found is None:
+        return None
+    return int(found.group(1)), int(found.group(2))
+
+
+def _merge_line(
+    record: FileCoverage, number: int, covered: int, branch: tuple[int, int] | None
+) -> None:
+    """A line is covered when any report covered it; its branches keep the best counts."""
+
+    record[number] = (max(record.get(number, (0, 1))[0], covered), 1)
+    if branch is None:
+        return
+    current = record.branches.get(number, (0, 0))
+    record.branches[number] = (max(current[0], branch[0]), max(current[1], branch[1]))
+
+
+def parse_cobertura(text: str, root: Path) -> dict[str, FileCoverage]:
+    """Key files by their path relative to `root`; classes that name one file merge."""
+
+    found: dict[str, FileCoverage] = {}
+    for class_node in ET.fromstring(text.lstrip("\ufeff")).iter("class"):
+        key = _cobertura_key(class_node.get("filename", ""), root)
+        if key is None:
+            continue
+        record = found.setdefault(key, FileCoverage())
+        for line in class_node.iter("line"):
+            number = int(line.get("number") or "0")
+            covered = 1 if int(line.get("hits") or "0") > 0 else 0
+            _merge_line(record, number, covered, _condition_coverage(line))
+    return found
+
+
 @dataclass
 class JacocoMethod:
     missed: int
@@ -543,6 +604,29 @@ def _merge_jacoco(root: Path) -> dict[str, list[JacocoMethod]]:
     return merged
 
 
+def _merge_cobertura(root: Path) -> dict[str, FileCoverage]:
+    """Merge reports file by file, as one report merges its classes.
+
+    Cobertura gives only a count per line, so two reports that took different
+    branches of one line under-count it. An unreadable report is skipped with
+    a warning, so the other reports still score.
+    """
+
+    resolved = root.resolve()
+    merged: dict[str, FileCoverage] = {}
+    for path in sorted((root / "target" / "coverage" / "fsharp").rglob("*.cobertura.xml")):
+        try:
+            parsed = parse_cobertura(path.read_text(encoding="utf-8", errors="replace"), resolved)
+        except (ET.ParseError, OSError, ValueError) as exc:
+            print(f"{path}: unreadable Cobertura report ({exc}); skipped.", file=sys.stderr)
+            continue
+        for key, record in parsed.items():
+            into = merged.setdefault(key, FileCoverage())
+            for number, (covered, _total) in record.items():
+                _merge_line(into, number, covered, record.branches.get(number))
+    return merged
+
+
 def _merge_forms(root: Path) -> dict[str, dict[int, tuple[int, int]]]:
     coverage_dir = root / "target" / "coverage"
     found: dict[str, dict[int, tuple[int, int]]] = {}
@@ -559,10 +643,14 @@ def _merge_forms(root: Path) -> dict[str, dict[int, tuple[int, int]]]:
 
 
 def load_bundle(root: Path) -> CoverageBundle:
+    """The Cobertura reports of a file win over an LCOV record of that file."""
+
     go_profile = _merge_go(root)
     jacoco = _merge_jacoco(root)
+    lcov = _merge_lcov(root)
+    lcov.update(_merge_cobertura(root))
     return CoverageBundle(
-        lcov=_merge_lcov(root),
+        lcov=lcov,
         go_profile=go_profile or None,
         jacoco=jacoco or None,
         form_html=_merge_forms(root),

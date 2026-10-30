@@ -1,3 +1,4 @@
+from crapper.analyze import analyze_files
 from crapper.coverage import (
     CoverageBundle,
     go_percent,
@@ -158,3 +159,130 @@ def test_load_bundle_merges_each_report(tmp_path):
     assert bundle.percent_for(function(start_line=3, end_line=4)) == 50.0
     assert bundle.go_profile is not None
     assert bundle.jacoco is not None
+
+
+def _cobertura(filename, lines, name="Demo.Board"):
+    """One Cobertura report with one class; `lines` are (number, hits, "covered/total" or None)."""
+
+    rows = "".join(
+        f'<line number="{number}" hits="{hits}" branch="{"True" if cond else "False"}"'
+        + (f' condition-coverage="50% ({cond})"' if cond else "")
+        + " />"
+        for number, hits, cond in lines
+    )
+    return (
+        '\ufeff<?xml version="1.0" encoding="utf-8"?>\n<coverage><packages><package name="Demo">'
+        f'<classes><class name="{name}" filename="{filename}"><methods/><lines>{rows}</lines>'
+        "</class></classes></package></packages></coverage>"
+    )
+
+
+def _write_cobertura(root, project, text):
+    report = root / "target" / "coverage" / "fsharp" / project / "4f2c" / "me_host_2026.cobertura.xml"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(text, encoding="utf-8")
+
+
+def _fsharp_percent(root, start_line, end_line, path="src/Board.fs"):
+    scored = function(
+        namespace="Demo.Board",
+        start_line=start_line,
+        end_line=end_line,
+        path=path,
+        language="fsharp",
+    )
+    return load_bundle(root).percent_for(scored)
+
+
+def test_cobertura_condition_coverage_scores_a_function_and_line_hits_score_a_branchless_one(tmp_path):
+    source = tmp_path / "src" / "Board.fs"
+    _write_cobertura(
+        tmp_path,
+        "Board.Tests",
+        _cobertura(source, [(3, 4, None), (4, 1, "1/2"), (5, 0, None), (8, 2, None), (9, 0, None)]),
+    )
+    assert _fsharp_percent(tmp_path, 3, 5) == 50.0
+    assert _fsharp_percent(tmp_path, 8, 9) == 50.0
+
+
+def test_the_same_fsharp_file_in_two_cobertura_reports_merges_in_either_load_order(tmp_path):
+    reports = [
+        [(3, 0, None), (4, 0, "0/2")],
+        [(3, 35, None), (4, 2, "2/2")],
+    ]
+    for name, order in (("ab", reports), ("ba", reports[::-1])):
+        root = tmp_path / name
+        source = root / "src" / "Board.fs"
+        _write_cobertura(root, "One.Tests", _cobertura(source, order[0]))
+        _write_cobertura(root, "Two.Tests", _cobertura(source, order[1]))
+        assert _fsharp_percent(root, 3, 3) == 100.0
+        assert _fsharp_percent(root, 3, 4) == 100.0
+
+
+def test_branches_on_a_line_take_the_highest_covered_count_any_report_gives(tmp_path):
+    source = tmp_path / "src" / "Board.fs"
+    _write_cobertura(tmp_path, "One.Tests", _cobertura(source, [(4, 1, "1/4")]))
+    _write_cobertura(tmp_path, "Two.Tests", _cobertura(source, [(4, 1, "3/4")]))
+    assert _fsharp_percent(tmp_path, 4, 4) == 75.0
+
+
+def test_a_line_listed_under_two_classes_of_one_report_merges_like_two_reports(tmp_path):
+    source = tmp_path / "src" / "Board.fs"
+    first = _cobertura(source, [(3, 0, "0/2")], name="Demo.Board")
+    second = _cobertura(source, [(3, 1, "1/2")], name="Demo.Board/choose@3")
+    classes = first.split("<classes>")[1].split("</classes>")[0]
+    _write_cobertura(tmp_path, "Board.Tests", second.replace("<classes>", "<classes>" + classes))
+    assert _fsharp_percent(tmp_path, 3, 3) == 50.0
+
+
+def test_a_cobertura_report_beats_an_lcov_info_for_the_same_fsharp_file(tmp_path):
+    source = tmp_path / "src" / "Board.fs"
+    lcov = tmp_path / "target" / "coverage" / "fsharp" / "lcov.info"
+    lcov.parent.mkdir(parents=True)
+    lcov.write_text("SF:src/Board.fs\nDA:3,5\nend_of_record\n", encoding="utf-8")
+    _write_cobertura(tmp_path, "Board.Tests", _cobertura(source, [(3, 0, None)]))
+    assert _fsharp_percent(tmp_path, 3, 3) == 0.0
+
+
+def test_a_file_outside_the_project_such_as_fsharp_core_matches_no_entry(tmp_path):
+    outside = "/Users/runner/work/1/s/src/fsharp/src/FSharp.Core/array.fs"
+    _write_cobertura(tmp_path, "Board.Tests", _cobertura(outside, [(3, 5, None)]))
+    assert _fsharp_percent(tmp_path, 3, 3, path="array.fs") is None
+    assert _fsharp_percent(tmp_path, 3, 3, path="FSharp.Core/array.fs") is None
+
+
+def test_a_windows_path_fsharp_core_file_in_a_report_matches_no_project_entry(tmp_path):
+    outside = "D:\\a\\_work\\1\\s\\src\\FSharp.Core\\array.fs"
+    _write_cobertura(tmp_path, "Board.Tests", _cobertura(outside, [(3, 5, None)]))
+    assert _fsharp_percent(tmp_path, 3, 3, path="src/FSharp.Core/array.fs") is None
+    assert _fsharp_percent(tmp_path, 3, 3, path="FSharp.Core/array.fs") is None
+
+
+def test_an_unreadable_cobertura_report_is_skipped_with_a_warning(tmp_path, capsys):
+    source = tmp_path / "src" / "Board.fs"
+    _write_cobertura(tmp_path, "Broken.Tests", "<coverage><packages>")
+    _write_cobertura(tmp_path, "Board.Tests", _cobertura(source, [(3, 1, None)]))
+    assert _fsharp_percent(tmp_path, 3, 3) == 100.0
+    assert "unreadable Cobertura report" in capsys.readouterr().err
+
+
+def test_a_script_function_no_coverage_report_mentions_scores_zero(tmp_path):
+    board = tmp_path / "src" / "Board.fs"
+    board.parent.mkdir(parents=True)
+    board.write_text("module Board\n\nlet place x = x + 1\n", encoding="utf-8")
+    script = tmp_path / "build.fsx"
+    script.write_text("let publish target = target\n", encoding="utf-8")
+    _write_cobertura(tmp_path, "Board.Tests", _cobertura(board.resolve(), [(3, 1, None)]))
+    found = analyze_files([board, script], tmp_path, load_bundle(tmp_path))
+    assert sorted((entry.name, entry.coverage) for entry in found) == [
+        ("place", 100.0),
+        ("publish", 0.0),
+    ]
+
+
+def test_a_cobertura_report_with_a_non_numeric_line_attribute_is_skipped_with_a_warning(tmp_path, capsys):
+    source = tmp_path / "src" / "Board.fs"
+    _write_cobertura(tmp_path, "Broken.Tests", _cobertura(source, [("three", 1, None)]))
+    _write_cobertura(tmp_path, "Board.Tests", _cobertura(source, [(3, 1, None)]))
+    assert _fsharp_percent(tmp_path, 3, 3) == 100.0
+    assert "unreadable Cobertura report" in capsys.readouterr().err
