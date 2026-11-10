@@ -1,8 +1,8 @@
 # crapper
 
-This is a fork of [unclebob/crapper](https://github.com/unclebob/crapper) that adds F# support. Thanks to Robert C. Martin for the original tool.
+This is a fork of [unclebob/crapper](https://github.com/unclebob/crapper) that adds F# and Kotlin support. Thanks to Robert C. Martin for the original tool.
 
-CRAP scores for Clojure, Java, Go, TypeScript, Rust, Python, and F#. One run detects the language of each source file, applies that language's complexity and coverage rules, and writes the snapshot [uml-viewer](https://github.com/unclebob/uml-viewer) already reads.
+CRAP scores for Clojure, Java, Go, TypeScript, Rust, Python, F#, and Kotlin. One run detects the language of each source file, applies that language's complexity and coverage rules, and writes the snapshot [uml-viewer](https://github.com/unclebob/uml-viewer) already reads.
 
 The formula is the one from [crap4clj](https://github.com/unclebob/crap4clj), [crap4java](https://github.com/unclebob/crap4java), and [crap4go](https://github.com/unclebob/crap4go):
 
@@ -58,6 +58,7 @@ uml-viewer groups entries by `:namespace` and joins each operation on `:name`. `
 | Rust | `crate::module`, or `crate::module::Type` | the function or method name |
 | Python | the dotted module path, or `module.Class` | the function or method name |
 | F# | the `namespace` and `module` path, or `Namespace.Module.Type` | the function, member, or active pattern name |
+| Kotlin | the `package`, or `package.Class` (`package.Outer.Inner`, `package.Class.Companion`, `package.Enum.VALUE`) | the function name |
 
 Rename or move is a new entry. There is no identity matching across runs.
 
@@ -77,6 +78,8 @@ Python counts `if`, `elif`, `for`, `while`, `except`, each `match` case, a compr
 
 F# (`.fs` and `.fsx`) counts `if`, `elif`, `for`, `while`, each arm of `match`, `function`, and `try ... with`, each `when` guard, and `&&` / `||`; `let!` and combinators such as `Option.map` add nothing. Module- and type-level functions, members, active patterns, and values bound to a lambda or an object expression are entries. Signature files (`.fsi`), `bin`, `obj`, and `*.Test` / `*.Tests` folders are skipped. Coverage is Cobertura from Microsoft Code Coverage, run per test project, with nothing to install. A `--coverage-command` for F# writes its Cobertura reports under `target/coverage/fsharp/`.
 
+Kotlin (`.kt`) counts `if`, `for`, `while`, `do ... while`, each `when` arm except `else`, each `catch`, and each `&&`, `||`, `?:`, and `?.`. Top-level functions, extension functions, and the functions of classes, objects, companion objects, and enum values with their own body are entries; a local function, a lambda, or an anonymous object stays in the enclosing function. Constructors, `init` blocks, property accessors, and abstract functions are not entries. A file with no `package` line uses the file stem as the namespace of its top-level functions. Gradle scripts (`.kts`), `build`, `src/test`, and `src/*Test` source sets such as `src/androidTest` and `src/commonTest` are skipped. Coverage is Kover's `INSTRUCTION` counter, read like JaCoCo's: a function takes every method of its JVM class named after it, including `name-<hash>` (value-class mangling) and `name$...` (lambdas, `internal` names, default-argument bridges). Kover records no line numbers, so overloads share one percentage. Kover is a prerequisite crapper does not add: apply `id("org.jetbrains.kotlinx.kover")` in the root build file, with `kover(project(":module"))` for each module under `dependencies`, and in each module's build file. Without it the run warns with those lines and Kotlin scores 0%.
+
 ## Coverage commands
 
 By default a run deletes the previous report for each language it is about to measure and regenerates it:
@@ -90,6 +93,7 @@ By default a run deletes the previous report for each language it is about to me
 | Rust | `cargo llvm-cov` or `cargo tarpaulin`, per Cargo package | `target/coverage/rust/lcov.info` |
 | Python | `coverage run` with pytest or unittest, then `coverage lcov` | `target/coverage/python/lcov.info` |
 | F# | `dotnet test <project> --collect:"Code Coverage;Format=cobertura"`, per test project | `target/coverage/fsharp/**/*.cobertura.xml` |
+| Kotlin | `./gradlew :koverXmlReport` (or `gradle`) in the directory with `settings.gradle.kts` or `settings.gradle`, when its build file applies Kover | `build/reports/kover/report.xml` |
 
 A missing tool or a failed test run scores that language at 0% and still writes the snapshot. Pass `--coverage-command` to replace those defaults with one command of your own. `--no-coverage` is the run that leaves coverage and CRAP as N/A.
 
