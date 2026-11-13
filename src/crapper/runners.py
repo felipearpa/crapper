@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 from crapper.discover import DOTNET_BUILD_DIRS, SKIP_DIRS, is_test_file, language_of
+from crapper.languages import swift_coverage
 
 _MAVEN = [
     "mvn",
@@ -55,7 +56,7 @@ def run_shell(command: str | list[str], cwd: Path) -> int:
     return completed.returncode
 
 
-def _nearest(start: Path, marker: str, stop: Path) -> Path | None:
+def nearest_marker(start: Path, marker: str, stop: Path) -> Path | None:
     current = start if start.is_dir() else start.parent
     stop = stop.resolve()
     while True:
@@ -71,28 +72,33 @@ def _clean_dir(path: Path) -> None:
         shutil.rmtree(path)
 
 
-_COVERAGE_DIRS = {"typescript", "rust", "go", "python", "fsharp"}
+_COVERAGE_DIRS = {"typescript", "rust", "go", "python", "fsharp", "swift"}
 
 
-def _outside_language_dirs(coverage: Path, path: Path) -> bool:
-    relative = path.relative_to(coverage)
-    if path.name in _COVERAGE_DIRS:
-        return False
-    return not _COVERAGE_DIRS.intersection(relative.parts)
+def _walk_outside_language_dirs(coverage: Path):
+    """Each folder under `coverage` with its file names, never entering a language folder.
+
+    A language folder is skipped at any depth, and Swift's holds Xcode's
+    derived data, so it is not walked at all.
+    """
+
+    for dirpath, dirnames, filenames in os.walk(coverage):
+        dirnames[:] = [name for name in dirnames if name not in _COVERAGE_DIRS]
+        yield Path(dirpath), filenames
 
 
 def _remove_cloverage_html(coverage: Path) -> None:
-    for path in coverage.rglob("*.html"):
-        if not _outside_language_dirs(coverage, path):
-            continue
-        path.unlink()
+    for folder, filenames in _walk_outside_language_dirs(coverage):
+        for name in filenames:
+            if name.endswith(".html"):
+                (folder / name).unlink()
 
 
 def _remove_empty_dirs(coverage: Path) -> None:
-    directories = [path for path in coverage.rglob("*") if path.is_dir()]
+    directories = [
+        folder for folder, _files in _walk_outside_language_dirs(coverage) if folder != coverage
+    ]
     for path in sorted(directories, reverse=True):
-        if not _outside_language_dirs(coverage, path):
-            continue
         try:
             path.rmdir()
         except OSError:
@@ -210,7 +216,7 @@ def typescript_packages(root: Path, files: list[Path]) -> list[Path]:
     for file in files:
         if language_of(file) != "typescript":
             continue
-        package = _nearest(file, "package.json", root)
+        package = nearest_marker(file, "package.json", root)
         if package is not None:
             packages.add(package.resolve())
     return sorted(packages)
@@ -249,13 +255,15 @@ def _vitest_includes(package: Path, files: list[Path]) -> list[str]:
     includes: list[str] = []
     package = package.resolve()
     for file in files:
-        if language_of(file) != "typescript" or is_test_file(file):
+        if language_of(file) != "typescript":
             continue
+        resolved = Path(file).resolve()
         try:
-            relative = Path(file).resolve().relative_to(package)
+            relative = resolved.relative_to(package)
         except ValueError:
             continue
-        includes.append(relative.as_posix())
+        if not is_test_file(resolved, package):
+            includes.append(relative.as_posix())
     return includes
 
 
@@ -324,7 +332,7 @@ def python_roots(root: Path, files: list[Path]) -> list[Path]:
             continue
         module = None
         for marker in _PYTHON_MARKERS:
-            module = _nearest(Path(file), marker, root)
+            module = nearest_marker(Path(file), marker, root)
             if module is not None:
                 break
         found.add((module or root).resolve())
@@ -356,13 +364,15 @@ def python_sources(package: Path, files: list[Path]) -> str:
     package = package.resolve()
     for file in files:
         path = Path(file)
-        if path.suffix != ".py" or is_test_file(path):
+        if path.suffix != ".py":
             continue
+        resolved = path.resolve()
         try:
-            relative = path.resolve().relative_to(package)
+            relative = resolved.relative_to(package)
         except ValueError:
             continue
-        tops.add(_source_name(relative))
+        if not is_test_file(resolved, package):
+            tops.add(_source_name(relative))
     return ",".join(sorted(tops))
 
 
@@ -422,7 +432,7 @@ def _modules_with(files: list[Path], suffix: str, marker: str, root: Path) -> li
     for file in files:
         if Path(file).suffix != suffix:
             continue
-        module = _nearest(file, marker, root)
+        module = nearest_marker(file, marker, root)
         if module is not None:
             modules.add(module)
     return sorted(modules)
@@ -647,7 +657,7 @@ def _gradle_roots(root: Path, files: list[Path]) -> list[Path]:
         if Path(file).suffix != ".kt":
             continue
         for marker in _GRADLE_SETTINGS:
-            build = _nearest(Path(file), marker, root)
+            build = nearest_marker(Path(file), marker, root)
             if build is not None:
                 found.add(build.resolve())
                 break
@@ -708,6 +718,31 @@ def _cover_kotlin(root: Path, files: list[Path]) -> None:
             _warn(f"Kotlin coverage exited {code} in {build}. Kotlin coverage will score 0%.")
 
 
+def _cover_swift(root: Path) -> None:
+    """crapper never starts a Swift test run; without a command Swift scores 0%."""
+
+    swift_coverage.remove_lcov(root)
+    _warn(
+        "Swift coverage needs --coverage-command with an Xcode or swift test command that "
+        f"leaves its coverage in {root / swift_coverage.COVERAGE_DIR}. "
+        "Swift coverage will score 0%. For example, for an Xcode project:\n"
+        f"  crapper --coverage-command '{swift_coverage.XCODE_COMMAND}'\n"
+        "or for a Swift package:\n"
+        f"  crapper --coverage-command '{swift_coverage.PACKAGE_COMMAND}'"
+    )
+
+
+def _after_command(root: Path, files: list[Path], code: int) -> None:
+    """Convert Swift coverage after the command; a failed one leaves no Swift LCOV."""
+
+    if "swift" not in _languages_in(files):
+        return
+    if code == 0:
+        swift_coverage.convert(root, files)
+    else:
+        swift_coverage.remove_lcov(root)
+
+
 def run_coverage(root: Path, files: list[Path], command: str | None) -> int:
     """Generate coverage reports for the languages present in `files`.
 
@@ -719,6 +754,7 @@ def run_coverage(root: Path, files: list[Path], command: str | None) -> int:
     root = root.resolve()
     if command:
         code = run_shell(command, root)
+        _after_command(root, files, code)
         if code != 0:
             _warn(
                 f"Coverage command exited {code}. "
@@ -743,4 +779,6 @@ def run_coverage(root: Path, files: list[Path], command: str | None) -> int:
         _cover_fsharp(root)
     if "kotlin" in languages:
         _cover_kotlin(root, files)
+    if "swift" in languages:
+        _cover_swift(root)
     return 0

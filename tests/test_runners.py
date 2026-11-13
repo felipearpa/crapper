@@ -353,6 +353,15 @@ def test_vitest_include_skips_a_file_outside_the_package(tmp_path):
     assert _vitest_includes(package, [package / "src" / "app.ts", outside]) == ["src/app.ts"]
 
 
+def test_vitest_include_of_a_package_inside_a_test_folder_name_skips_only_its_tests(tmp_path):
+    from crapper.runners import _vitest_includes
+
+    package = tmp_path / "spec" / "web"
+    source = _write(package, "src/app.ts", "export const n = 1\n")
+    helper = _write(package, "src/__tests__/helpers.ts", "export const h = 1\n")
+    assert _vitest_includes(package, [source, helper]) == ["src/app.ts"]
+
+
 def test_nested_module_coverage_report_is_slugged(tmp_path):
     module = tmp_path / "src-tauri"
     module.mkdir()
@@ -386,6 +395,13 @@ def test_pytest_detection_and_the_unittest_fallback(tmp_path, monkeypatch, capsy
 def test_python_sources_ignore_a_file_outside_the_package(tmp_path):
     inside = _write(tmp_path, "src/app.py", "def run():\n    return 1\n")
     assert python_sources(tmp_path, [inside, Path("/tmp/crapper-outside.py")]) == "src"
+
+
+def test_python_sources_of_a_package_inside_a_test_folder_name_skip_only_its_tests(tmp_path):
+    package = tmp_path / "tests" / "app"
+    inside = _write(package, "src/app.py", "def run():\n    return 1\n")
+    helper = _write(package, "tests/helpers.py", "def help():\n    return 1\n")
+    assert python_sources(package, [inside, helper]) == "src"
 
 
 def test_missing_python_module_is_installed(tmp_path, monkeypatch):
@@ -751,7 +767,7 @@ def test_a_failed_kover_run_warns_and_scores_zero(tmp_path, monkeypatch, capsys)
     _write(tmp_path, "gradlew", "#!/bin/sh\n")
     _stale_kover_report(tmp_path)
     _stale_kover_report(tmp_path, "app")
-    _stale_kover_report(tmp_path, "data/pool")
+    _stale_kover_report(tmp_path, "data/feature")
     monkeypatch.setattr("crapper.runners.run_shell", lambda command, cwd: 1)
     run_coverage(tmp_path, [source], None)
     assert "Kotlin coverage exited 1" in capsys.readouterr().err
@@ -765,3 +781,96 @@ def test_kotlin_without_gradle_settings_skips_kotlin_coverage(tmp_path, monkeypa
     run_coverage(tmp_path, [source], None)
     assert seen == []
     assert "skipping Kotlin coverage" in capsys.readouterr().err
+
+
+def _swift_project(root: Path) -> tuple[Path, Path, Path]:
+    """A Swift source, the profile a command left in its derived data, and an earlier LCOV file."""
+
+    source = _write(root, "Feature/Sources/Feature/Board.swift", "func place() {}\n")
+    profile = _write(root, "target/coverage/swift/DerivedData/Build/ProfileData/SIM/Coverage.profdata", "p")
+    lcov = _write(root, "target/coverage/swift/lcov.info", f"SF:{source}\nDA:1,1\nend_of_record\n")
+    return source, profile, lcov
+
+
+def test_a_coverage_command_that_exits_zero_converts_swift_coverage(tmp_path, monkeypatch):
+    source, _profile, _lcov = _swift_project(tmp_path)
+    converted = []
+    monkeypatch.setattr("crapper.runners.run_shell", lambda command, cwd: 0)
+    monkeypatch.setattr(
+        "crapper.runners.swift_coverage.convert", lambda root, files: converted.append((root, files))
+    )
+    assert run_coverage(tmp_path, [source], "xcodebuild test") == 0
+    assert converted == [(tmp_path.resolve(), [source])]
+
+
+def test_a_failed_coverage_command_converts_nothing_and_removes_the_old_swift_lcov(
+    tmp_path, monkeypatch
+):
+    source, profile, lcov = _swift_project(tmp_path)
+    converted = []
+    monkeypatch.setattr("crapper.runners.run_shell", lambda command, cwd: 65)
+    monkeypatch.setattr(
+        "crapper.runners.swift_coverage.convert", lambda root, files: converted.append(root)
+    )
+    assert run_coverage(tmp_path, [source], "xcodebuild test") == 65
+    assert converted == []
+    assert not lcov.exists()
+    assert profile.is_file()
+    entries = analyze_files([source], tmp_path, load_bundle(tmp_path))
+    assert [entry.coverage for entry in entries] == [0.0]
+
+
+def test_a_coverage_command_without_swift_files_converts_nothing(tmp_path, monkeypatch):
+    _source, _profile, lcov = _swift_project(tmp_path)
+    go = _write(tmp_path, "main.go", "package main\n")
+    monkeypatch.setattr("crapper.runners.run_shell", lambda command, cwd: 0)
+    monkeypatch.setattr(
+        "crapper.runners.swift_coverage.convert",
+        lambda root, files: pytest.fail("converted without Swift files"),
+    )
+    assert run_coverage(tmp_path, [go], "go test ./...") == 0
+    assert lcov.is_file()
+
+
+def test_without_a_command_swift_warns_removes_its_lcov_and_keeps_the_derived_data(
+    tmp_path, monkeypatch, capsys
+):
+    source, profile, lcov = _swift_project(tmp_path)
+    seen = []
+    monkeypatch.setattr("crapper.runners.run_shell", lambda command, cwd: seen.append(command) or 0)
+    assert run_coverage(tmp_path, [source], None) == 0
+    err = capsys.readouterr().err
+    assert seen == []
+    assert "--coverage-command" in err
+    assert "target/coverage/swift" in err
+    assert "xcodebuild test" in err
+    assert "swift test --enable-code-coverage" in err
+    assert "swift test --show-codecov-path" in err
+    assert "Swift coverage will score 0%" in err
+    assert not lcov.exists()
+    assert profile.is_file()
+    entries = analyze_files([source], tmp_path, load_bundle(tmp_path))
+    assert [entry.coverage for entry in entries] == [0.0]
+
+
+def test_clean_clojure_leaves_the_swift_folder_untouched(tmp_path):
+    _source, profile, lcov = _swift_project(tmp_path)
+    _clean_clojure(tmp_path)
+    assert lcov.is_file()
+    assert profile.is_file()
+
+
+def test_clean_clojure_leaves_empty_folders_and_html_inside_language_folders(tmp_path):
+    coverage = tmp_path / "target" / "coverage"
+    empty = coverage / "swift" / "DerivedData" / "Logs" / "Test"
+    empty.mkdir(parents=True)
+    page = coverage / "swift" / "DerivedData" / "Docs" / "index.html"
+    page.parent.mkdir(parents=True)
+    page.write_text("<html></html>", encoding="utf-8")
+    stale = coverage / "demo" / "core.clj.html"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("x", encoding="utf-8")
+    _clean_clojure(tmp_path)
+    assert empty.is_dir()
+    assert page.is_file()
+    assert not stale.parent.exists()

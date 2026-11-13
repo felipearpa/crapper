@@ -254,6 +254,38 @@ def test_kotlin_test_source_sets_build_output_and_gradle_scripts_are_not_scored(
     ]
 
 
+def test_swift_test_folders_manifests_and_build_folders_are_not_scored(tmp_path):
+    files = {
+        "Feature/Sources/Feature/FeatureView.swift": "struct FeatureView { func show() {} }\n",
+        "Feature/Package.swift": "let package = Package(name: \"Feature\")\n",
+        "Feature/Tests/FeatureTests/FeatureViewTests.swift": "func t() {}\n",
+        "App/AppUITests/LaunchTests.swift": "func u() {}\n",
+        "App/.build/checkouts/Dep/Dep.swift": "func d() {}\n",
+        "App/Pods/Lib/Lib.swift": "func p() {}\n",
+        "App/Carthage/Checkouts/Lib.swift": "func c() {}\n",
+        "App/DerivedData/App/Gen.swift": "func g() {}\n",
+        "shared/src/mainTests/kotlin/demo/Board.kt": "package demo\nfun place() = 1\n",
+    }
+    for relative, text in files.items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    assert iter_source_files([tmp_path]) == [
+        (tmp_path / "Feature/Sources/Feature/FeatureView.swift").resolve(),
+        (tmp_path / "shared/src/mainTests/kotlin/demo/Board.kt").resolve(),
+    ]
+
+
+@pytest.mark.parametrize("outer", ["Pods", "DerivedData"])
+def test_a_project_inside_a_build_folder_name_keeps_its_swift_files(tmp_path, outer):
+    root = tmp_path / outer / "MyApp"
+    for relative in ("Sources/App/App.swift", "Pods/Lib/Lib.swift", ".build/checkouts/Dep.swift"):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("func f() {}\n", encoding="utf-8")
+    assert iter_source_files([root]) == [(root / "Sources/App/App.swift").resolve()]
+
+
 def test_missing_coverage_scores_zero_and_sorts_ahead_of_a_covered_function(tmp_path):
     low = tmp_path / "src" / "low.ts"
     high = tmp_path / "src" / "high.ts"

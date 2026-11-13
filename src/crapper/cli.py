@@ -18,8 +18,10 @@ from crapper.discover import (
     JS_TEST_SUFFIXES,
     KOTLIN_TEST_SOURCE_SET_SUFFIX,
     SKIP_DIRS,
+    SWIFT_MANIFEST,
+    SWIFT_TEST_DIR_SUFFIX,
     TEST_DIRS,
-    is_test_file,
+    is_scored,
     iter_source_files,
     language_of,
 )
@@ -50,7 +52,7 @@ and prints a report sorted worst first.
 
 Languages: Clojure (.clj .cljc .cljs .bb), Java (.java), Go (.go),
 TypeScript and JavaScript (.ts .tsx .mts .cts .js .jsx .mjs .cjs),
-Rust (.rs), Python (.py), F# (.fs .fsx), Kotlin (.kt).
+Rust (.rs), Python (.py), F# (.fs .fsx), Kotlin (.kt), Swift (.swift).
 
 Options:
   -h, --help                    Print this help and exit.
@@ -79,10 +81,14 @@ Arguments:
 
 With no paths, source files under the project root are analyzed. Directories
 named {_SKIPPED_DIRS} are skipped, as are {_TEST_PATTERNS}.
+Folder names count only below the project root, so a project that itself
+lives in a folder named tests or *Tests is still analyzed.
 
 F# also skips .fsi files, bin, obj, and {_TEST_DIRS_DOTNET} folders.
 Kotlin also skips .kts files and src/*{KOTLIN_TEST_SOURCE_SET_SUFFIX} source sets
 such as src/androidTest.
+Swift also skips {SWIFT_MANIFEST} and folders named {SWIFT_TEST_DIR_SUFFIX} or *{SWIFT_TEST_DIR_SUFFIX}
+such as CoreTests.
 
 Coverage, when it is produced:
   Clojure      clj -M:cov --lcov, then Cloverage form counts or LCOV
@@ -94,6 +100,22 @@ Coverage, when it is produced:
   F#           dotnet test Cobertura coverage, per .NET test project
   Kotlin       gradlew :koverXmlReport in the Gradle root, which must apply
                the Kover plugin; build/reports/kover/report.xml
+  Swift        only with --coverage-command: an Xcode test run with coverage
+               and its derived data in target/coverage/swift/, whose profile
+               crapper converts with llvm-cov, or a swift test export copied
+               there; both go to target/coverage/swift/lcov.info.
+               Xcode example:
+               --coverage-command 'rm -rf target/coverage/swift &&
+                 xcodebuild test -workspace App.xcworkspace -scheme App \\
+                 -destination "platform=iOS Simulator,name=iPhone 17" \\
+                 -enableCodeCoverage YES \\
+                 -derivedDataPath target/coverage/swift/DerivedData'
+               Swift package example:
+               --coverage-command 'rm -rf target/coverage/swift &&
+                 mkdir -p target/coverage/swift &&
+                 swift test --enable-code-coverage &&
+                 cp "$(swift test --show-codecov-path)" target/coverage/swift/'
+               Without the command, or when it exits non-zero, Swift scores 0%.
 
 uml-viewer joins .metrics/crap.edn on :namespace and :name.
   Clojure      the ns, and the defn name
@@ -104,6 +126,7 @@ uml-viewer joins .metrics/crap.edn on :namespace and :name.
   Python       dotted module path, or module.Class for methods
   F#           namespace and module path, or path.Type for members
   Kotlin       the package, or package.Class for members
+  Swift        the module after Sources/, then the type chain, or the file stem
 """
 
 
@@ -368,18 +391,14 @@ def _positionals(root: Path, args: list[str]) -> tuple[list[Path], list[str]]:
 
 
 def _changed_source(root: Path) -> list[Path]:
-    return [
-        path
-        for path in _changed_files(root)
-        if language_of(path) is not None and not is_test_file(path)
-    ]
+    return [path for path in _changed_files(root) if is_scored(path, root)]
 
 
-def _explicit_files(existing: list[Path]) -> list[Path]:
+def _explicit_files(root: Path, existing: list[Path]) -> list[Path]:
     files: list[Path] = []
     for path in existing:
         if path.is_dir():
-            files.extend(iter_source_files([path]))
+            files.extend(iter_source_files([path], root))
         elif language_of(path) is not None:
             files.append(path)
     return files
@@ -389,10 +408,10 @@ def _selected(options: Options, root: Path, existing: list[Path]) -> list[Path]:
     if options.changed or options.changed_functions:
         return _changed_source(root)
     if options.source_roots:
-        return iter_source_files([(root / path).resolve() for path in options.source_roots])
+        return iter_source_files([(root / path).resolve() for path in options.source_roots], root)
     if existing:
-        return _explicit_files(existing)
-    return iter_source_files([root])
+        return _explicit_files(root, existing)
+    return iter_source_files([root], root)
 
 
 def _apply_filters(files: list[Path], filters: list[str]) -> list[Path]:

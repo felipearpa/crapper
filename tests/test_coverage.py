@@ -161,6 +161,24 @@ def test_load_bundle_merges_each_report(tmp_path):
     assert bundle.jacoco is not None
 
 
+def test_load_bundle_reads_swifts_lcov_but_nothing_below_the_swift_folder(tmp_path):
+    coverage = tmp_path / "target" / "coverage"
+    swift = coverage / "swift"
+    stray = swift / "DerivedData" / "SourcePackages" / "checkouts" / "Dep"
+    stray.mkdir(parents=True)
+    (swift / "lcov.info").write_text("SF:/app/App.swift\nDA:1,1\nend_of_record\n", encoding="utf-8")
+    (stray / "lcov.info").write_text("SF:/dep/Dep.swift\nDA:1,1\nend_of_record\n", encoding="utf-8")
+    forms = '<span title="1 out of 2 forms covered">   4&nbsp;&nbsp;(if x 1)</span>'
+    (stray / "index.html").write_text(forms, encoding="utf-8")
+    (swift / "report.html").write_text(forms, encoding="utf-8")
+    rust = coverage / "rust" / "nested"
+    rust.mkdir(parents=True)
+    (rust / "lcov.info").write_text("SF:src/lib.rs\nDA:1,1\nend_of_record\n", encoding="utf-8")
+    bundle = load_bundle(tmp_path)
+    assert sorted(bundle.lcov) == ["/app/App.swift", "src/lib.rs"]
+    assert bundle.form_html == {"swift/report": {4: (1, 2)}}
+
+
 def _cobertura(filename, lines, name="Demo.Board"):
     """One Cobertura report with one class; `lines` are (number, hits, "covered/total" or None)."""
 
@@ -376,7 +394,7 @@ def test_a_kotlin_function_whose_class_is_absent_from_the_report_scores_zero(tmp
 def test_kover_reports_at_the_root_and_two_levels_down_merge_with_jacoco(tmp_path):
     _write_kover(tmp_path, ".", {"demo/BoardKt": [("place", 0, 4)]})
     _write_kover(tmp_path, "app", {"demo/Board": [("tick", 1, 1)]})
-    _write_kover(tmp_path, "data/pool", {"demo/Board": [("clear", 3, 1)]})
+    _write_kover(tmp_path, "data/feature", {"demo/Board": [("clear", 3, 1)]})
     jacoco = tmp_path / "target" / "site" / "jacoco" / "jacoco.xml"
     jacoco.parent.mkdir(parents=True)
     jacoco.write_text(
@@ -400,7 +418,7 @@ def test_kover_reports_at_the_root_and_two_levels_down_merge_with_jacoco(tmp_pat
 
 def test_an_interface_default_function_scores_from_the_interface_not_its_default_impls_bridge(tmp_path):
     # Kotlin 2 compiles the body into the interface and leaves a two-instruction
-    # bridge in `$DefaultImpls`, as tyche's report shows for `SavedBet.scoreOrNull`.
+    # bridge in `$DefaultImpls`; Kover reports both.
     _write_kover(
         tmp_path,
         ".",
@@ -408,3 +426,49 @@ def test_an_interface_default_function_scores_from_the_interface_not_its_default
     )
     source = "package demo\n\ninterface Saved {\n    fun scoreOrNull(): Int? {\n        return null\n    }\n}\n"
     assert _kotlin_scores(tmp_path, source) == [("demo.Saved", "scoreOrNull", 100.0)]
+
+
+def _go_module(module_dir, module_line, profile_text):
+    module_dir.mkdir(parents=True, exist_ok=True)
+    (module_dir / "go.mod").write_text(f"{module_line}\n\ngo 1.21\n", encoding="utf-8")
+    profile = module_dir / "target" / "coverage" / "go" / "coverage.out"
+    profile.parent.mkdir(parents=True)
+    profile.write_text(profile_text, encoding="utf-8")
+
+
+def test_go_coverage_names_a_nested_file_by_its_module_import_path(tmp_path):
+    # `go test` keys a profile by import path. The module is `example.com/api`
+    # but its directory is `svc`, so no suffix of `svc/calc/calc.go` names it.
+    _go_module(
+        tmp_path / "svc",
+        "module example.com/api // the service",
+        "mode: set\n"
+        "example.com/api/calc/calc.go:4.2,4.11 1 1\n"
+        "example.com/api/calc/calc.go:5.3,6.1 1 0\n",
+    )
+    bundle = load_bundle(tmp_path)
+    scored = function(language="go", path="svc/calc/calc.go", start_line=3, end_line=7)
+    assert bundle.percent_for(scored) == 50.0
+
+
+def test_go_coverage_reads_a_quoted_module_path(tmp_path):
+    _go_module(
+        tmp_path / "cli",
+        'module "github.com/acme/tool"',
+        "mode: set\n"
+        "github.com/acme/tool/main.go:1.1,2.2 1 1\n"
+        "github.com/acme/tool/cmd/main.go:1.1,2.2 1 0\n",
+    )
+    bundle = load_bundle(tmp_path)
+    assert bundle.percent_for(function(language="go", path="cli/main.go", start_line=1, end_line=2)) == 100.0
+    assert bundle.percent_for(function(language="go", path="cli/cmd/main.go", start_line=1, end_line=2)) == 0.0
+
+
+def test_go_coverage_falls_back_to_the_path_without_a_module_name(tmp_path):
+    profile = tmp_path / "target" / "coverage" / "go" / "coverage.out"
+    profile.parent.mkdir(parents=True)
+    profile.write_text("mode: set\nproj/board.go:1.1,2.2 1 1\n", encoding="utf-8")
+    scored = function(language="go", path="board.go", start_line=1, end_line=2)
+    assert load_bundle(tmp_path).percent_for(scored) == 100.0
+    (tmp_path / "go.mod").write_text("go 1.21\n", encoding="utf-8")
+    assert load_bundle(tmp_path).percent_for(scored) == 100.0

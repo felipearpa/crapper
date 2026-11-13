@@ -4,13 +4,15 @@ Clojure prefers Cloverage's per-line form counts, then LCOV. Java uses JaCoCo
 instruction counters, and Kotlin the same counters from Kover's JaCoCo-shaped
 report. Go uses statement profiles. Cobertura reports join the
 LCOV index. LCOV scores a function by its BRDA branch records when it has any,
-and by line hits otherwise.
+and by line hits otherwise. Swift's LCOV is converted from Xcode profile data
+or `swift test` exports by `crapper.languages.swift_coverage` before the loader runs.
 `percent_for` returns None when the file is absent; analysis turns that into 0%.
 """
 
 from __future__ import annotations
 
 import functools
+import os
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -19,6 +21,7 @@ from pathlib import Path, PureWindowsPath
 from urllib.parse import unquote
 
 from crapper.model import Function
+from crapper.runners import nearest_marker
 
 _SPAN = re.compile(
     r'<span[^>]*title="(\d+) out of (\d+) forms covered"[^>]*>\s*(\d+)&nbsp;'
@@ -332,6 +335,21 @@ def _profile_segments(profile, path: str, source_parts: list[tuple[str, ...]] | 
     return profile[key]
 
 
+_GO_MODULE = re.compile(r'^\s*module\s+"?([^"\s]+)"?', re.MULTILINE)
+
+
+def go_import_name(file: Path, stop: Path) -> str | None:
+    """The name `go test -coverprofile` gives a file: its module path plus its path in the module."""
+
+    module_dir = nearest_marker(file, "go.mod", stop)
+    if module_dir is None:
+        return None
+    found = _GO_MODULE.search(_read(module_dir / "go.mod") or "")
+    if found is None:
+        return None
+    return f"{found.group(1)}/{file.relative_to(module_dir).as_posix()}"
+
+
 def go_percent(
     profile: dict[str, list[tuple[int, int, int, int]]] | None,
     path: str,
@@ -339,7 +357,10 @@ def go_percent(
     end: int,
     source_parts: list[tuple[str, ...]] | None = None,
 ) -> float | None:
-    segments = _profile_segments(profile, path, source_parts)
+    return _segments_percent(_profile_segments(profile, path, source_parts), start, end)
+
+
+def _segments_percent(segments, start: int, end: int) -> float | None:
     if segments is None:
         return None
     total = 0
@@ -519,6 +540,7 @@ class CoverageBundle:
     jacoco: dict[str, list[JacocoMethod]] | None = None
     form_html: dict[str, dict[int, tuple[int, int]]] = field(default_factory=dict)
     source_parts: list[tuple[str, ...]] = field(default_factory=list)
+    root: Path | None = None
 
     def bind_sources(self, paths: list[str]) -> None:
         """Remember project files so a short path cannot take a longer file's report."""
@@ -546,13 +568,8 @@ class CoverageBundle:
                 self.jacoco or {}, names, function.name, function.start_line
             )
         if function.language == "go":
-            return go_percent(
-                self.go_profile,
-                function.path,
-                function.start_line,
-                function.end_line,
-                self.source_parts,
-            )
+            segments = self._go_segments(function.path)
+            return _segments_percent(segments, function.start_line, function.end_line)
         html = self._html_lines(function.path)
         if html is not None:
             return percent_for_range(html, function.start_line, function.end_line)
@@ -567,6 +584,17 @@ class CoverageBundle:
     @functools.cached_property
     def _jacoco_by_class(self) -> dict[str, list[tuple[str, JacocoMethod]]]:
         return _by_class(self.jacoco or {})
+
+    def _go_segments(self, path: str) -> list[tuple[int, int, int, int]] | None:
+        """Profile segments for one Go file: by import path, else by the longest path suffix."""
+
+        if self.go_profile is None:
+            return None
+        if self.root is not None:
+            name = go_import_name((self.root / path).resolve(), self.root)
+            if name in self.go_profile:
+                return self.go_profile[name]
+        return _profile_segments(self.go_profile, path, self.source_parts)
 
     def _html_lines(self, path: str) -> dict[int, tuple[int, int]] | None:
         return _lookup(self.form_html, path, self.source_parts)
@@ -590,8 +618,27 @@ def _read(path: Path) -> str | None:
     return path.read_text(encoding="utf-8", errors="replace")
 
 
+# Swift's coverage folder holds Xcode's derived data, a large tree whose own
+# files are not reports; only the LCOV file the converter writes at its top
+# is read.
+_SWIFT_COVERAGE_DIR = "swift"
+
+
+def _coverage_files(coverage_dir: Path, wanted) -> list[Path]:
+    """Files under `target/coverage` whose name is `wanted`, not below the Swift folder."""
+
+    swift = coverage_dir / _SWIFT_COVERAGE_DIR
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(coverage_dir):
+        folder = Path(dirpath)
+        if folder == swift:
+            dirnames.clear()
+        found.extend(folder / name for name in filenames if wanted(name))
+    return found
+
+
 def _lcov_paths(root: Path) -> list[Path]:
-    paths = list(root.glob("target/coverage/**/lcov.info"))
+    paths = _coverage_files(root / "target" / "coverage", lambda name: name == "lcov.info")
     paths.extend(root.glob("coverage/**/lcov.info"))
     return paths
 
@@ -674,7 +721,7 @@ def _merge_forms(root: Path) -> dict[str, dict[int, tuple[int, int]]]:
     found: dict[str, dict[int, tuple[int, int]]] = {}
     if not coverage_dir.is_dir():
         return found
-    for html_path in coverage_dir.rglob("*.html"):
+    for html_path in _coverage_files(coverage_dir, lambda name: name.endswith(".html")):
         text = _read(html_path)
         if not text or "forms covered" not in text:
             continue
@@ -696,4 +743,5 @@ def load_bundle(root: Path) -> CoverageBundle:
         go_profile=go_profile or None,
         jacoco=jacoco or None,
         form_html=_merge_forms(root),
+        root=root,
     )

@@ -5,8 +5,17 @@ from pathlib import Path
 
 import pytest
 
-from crapper.cli import GitError, _changed_files, _positionals, _take, main, parse_args, run
-from crapper.discover import is_test_file, language_of
+from crapper.cli import (
+    GitError,
+    _changed_files,
+    _positionals,
+    _take,
+    main,
+    parse_args,
+    run,
+    select_files,
+)
+from crapper.discover import is_test_file, iter_source_files, language_of
 
 
 def test_language_detection():
@@ -43,6 +52,15 @@ def test_kotlin_sources_are_kotlin_and_gradle_scripts_are_not_scored():
     assert is_test_file("shared/src/commonTest/kotlin/BoardTest.kt") is True
     assert is_test_file("app/src/main/kotlin/Board.kt") is False
     assert is_test_file("app/src/androidTest/java/BoardTest.java") is False
+
+
+def test_swift_sources_are_swift_and_manifests_tests_and_build_folders_are_not_scored():
+    assert language_of("Feature/Sources/Feature/FeatureView.swift") == "swift"
+    assert language_of("Feature/Package.swift") is None
+    assert is_test_file("Feature/Tests/FeatureTests/FeatureViewTests.swift") is True
+    assert is_test_file("App/AppUITests/LaunchTests.swift") is True
+    assert is_test_file("Feature/Sources/Feature/FeatureView.swift") is False
+    assert is_test_file("shared/CoreTests/kotlin/Board.kt") is False
 
 
 def _write(root: Path, relative: str, source: str) -> None:
@@ -310,6 +328,242 @@ def test_changed_selection_ignores_files_git_did_not_name(tmp_path, monkeypatch,
     assert "No source files" not in capsys.readouterr().out
 
 
+def test_changed_selection_skips_swift_manifests_tests_and_build_folders(tmp_path, monkeypatch):
+    changed = {
+        "Feature/Sources/Feature/FeatureView.swift": "struct FeatureView {\n    func kept() {}\n}\n",
+        "Feature/Package.swift": "func manifest() {}\n",
+        "Feature/Tests/FeatureTests/FeatureViewTests.swift": "func fromTests() {}\n",
+        "App/AppTests/AppTests.swift": "func fromAppTests() {}\n",
+        "App/Pods/Lib/Lib.swift": "func fromPods() {}\n",
+        "App/.build/checkouts/Dep.swift": "func fromBuild() {}\n",
+        "App/Carthage/Checkouts/Lib.swift": "func fromCarthage() {}\n",
+        "App/DerivedData/Gen.swift": "func fromDerivedData() {}\n",
+    }
+    for relative, text in changed.items():
+        _write(tmp_path, relative, text)
+    status = "".join(f"?? {relative}\0" for relative in changed)
+    monkeypatch.setattr("crapper.cli.subprocess.run", _git_status(tmp_path, status))
+    assert run(["--root", str(tmp_path), "--no-coverage", "--changed"]) == 0
+    text = (tmp_path / ".metrics" / "crap.edn").read_text(encoding="utf-8")
+    assert ':name "kept"' in text
+    assert text.count(":name ") == 1
+
+
+@pytest.mark.parametrize("outer", ["Pods", "DerivedData"])
+def test_changed_selection_keeps_swift_files_of_a_project_inside_a_build_folder_name(
+    tmp_path, monkeypatch, outer
+):
+    root = tmp_path / outer / "MyApp"
+    changed = {
+        "Sources/App/App.swift": "struct App {\n    func kept() {}\n}\n",
+        "Pods/Lib/Lib.swift": "func fromPods() {}\n",
+        ".build/checkouts/Dep.swift": "func fromBuild() {}\n",
+    }
+    for relative, text in changed.items():
+        _write(root, relative, text)
+    status = "".join(f"?? {relative}\0" for relative in changed)
+    monkeypatch.setattr("crapper.cli.subprocess.run", _git_status(root, status))
+    assert run(["--root", str(root), "--no-coverage", "--changed"]) == 0
+    text = (root / ".metrics" / "crap.edn").read_text(encoding="utf-8")
+    assert ':name "kept"' in text
+    assert text.count(":name ") == 1
+
+
+def _commit_then_modify(repo: Path, files: dict[str, str]) -> None:
+    """Commit `files` (relative path to contents), then modify each one."""
+
+    git = ["git", "-C", str(repo)]
+    subprocess.run([*git, "init"], check=True, capture_output=True)
+    subprocess.run([*git, "config", "user.email", "t@example.com"], check=True)
+    subprocess.run([*git, "config", "user.name", "t"], check=True)
+    for relative, text in files.items():
+        _write(repo, relative, text)
+    subprocess.run([*git, "add", "-A", "-f"], check=True)
+    subprocess.run([*git, "commit", "-m", "init"], check=True, capture_output=True)
+    for relative, text in files.items():
+        _write(repo, relative, text + "\n")
+
+
+def test_changed_selection_skips_fsharp_build_folders_in_a_real_repository(tmp_path):
+    _commit_then_modify(
+        tmp_path,
+        {
+            "Demo/Board.fs": "module Demo.Board\n\nlet kept x = x\n",
+            "Demo/bin/Debug/Gen.fs": "module Demo.Gen\n\nlet fromBin x = x\n",
+            "Demo/obj/Debug/Gen.fs": "module Demo.Gen\n\nlet fromObj x = x\n",
+        },
+    )
+    assert run(["--root", str(tmp_path), "--no-coverage", "--changed"]) == 0
+    text = (tmp_path / ".metrics" / "crap.edn").read_text(encoding="utf-8")
+    assert ':name "kept"' in text
+    assert text.count(":name ") == 1
+
+
+_PROJECT_WITH_VENDOR_AND_BUILD = {
+    "src/app.py": "def kept():\n    return 1\n",
+    "vendor/lib/dep.py": "def from_vendor():\n    return 1\n",
+    "build/generated/gen.py": "def from_build():\n    return 1\n",
+    "Pods/Lib/Lib.swift": "func fromPods() {}\n",
+}
+
+
+def test_changed_selection_skips_committed_vendor_and_build_folders(tmp_path):
+    _commit_then_modify(tmp_path, _PROJECT_WITH_VENDOR_AND_BUILD)
+    assert run(["--root", str(tmp_path), "--no-coverage", "--changed"]) == 0
+    text = (tmp_path / ".metrics" / "crap.edn").read_text(encoding="utf-8")
+    assert ':name "kept"' in text
+    assert text.count(":name ") == 1
+
+
+@pytest.mark.parametrize(
+    ("args", "name"),
+    [
+        (["vendor"], "from_vendor"),
+        (["--source-root", "build/generated"], "from_build"),
+        (["Pods/Lib"], "fromPods"),
+        (["--source-root", "Pods/Lib"], "fromPods"),
+    ],
+)
+def test_a_skipped_folder_named_on_the_command_line_is_scored(tmp_path, args, name):
+    for relative, text in _PROJECT_WITH_VENDOR_AND_BUILD.items():
+        _write(tmp_path, relative, text)
+    assert run(["--root", str(tmp_path), "--no-coverage", *args]) == 0
+    text = (tmp_path / ".metrics" / "crap.edn").read_text(encoding="utf-8")
+    assert f':name "{name}"' in text
+    assert text.count(":name ") == 1
+
+
+# A Swift package next to dependency checkouts and Xcode output in every language.
+_IOS_PROJECT_WITH_BUILD_FOLDERS = {
+    "Feature/Sources/Feature/FeatureView.swift": "struct FeatureView {\n    func kept() {}\n}\n",
+    "Feature/.build/checkouts/dep/scripts/lint.py": "def from_checkouts():\n    return 1\n",
+    "Feature/.build/index-build/checkouts/dep/gen.js": "function fromIndexBuild() {\n  return 1;\n}\n",
+    "App/Pods/P/z.py": "def from_pods():\n    return 1\n",
+    "App/Carthage/Checkouts/c/c.go": "package c\n\nfunc FromCarthage() int { return 1 }\n",
+    "App/DerivedData/App/Build/d.py": "def from_derived_data():\n    return 1\n",
+}
+
+
+def test_ios_build_folders_are_skipped_for_every_language(tmp_path):
+    _commit_then_modify(tmp_path, _IOS_PROJECT_WITH_BUILD_FOLDERS)
+    kept = (tmp_path / "Feature/Sources/Feature/FeatureView.swift").resolve()
+    assert iter_source_files([tmp_path], tmp_path) == [kept]
+    assert run(["--root", str(tmp_path), "--no-coverage", "--changed"]) == 0
+    text = (tmp_path / ".metrics" / "crap.edn").read_text(encoding="utf-8")
+    assert ':name "kept"' in text
+    assert text.count(":name ") == 1
+
+
+@pytest.mark.parametrize("outer", ["build", "vendor", ".build", "Pods", "Carthage", "DerivedData"])
+def test_a_project_inside_a_skipped_folder_name_keeps_its_sources(tmp_path, outer):
+    root = tmp_path / outer / "app"
+    _commit_then_modify(
+        tmp_path,
+        {
+            f"{outer}/app/src/app.py": "def kept():\n    return 1\n",
+            f"{outer}/app/{outer}/dep.py": "def skipped():\n    return 1\n",
+        },
+    )
+    assert iter_source_files([root], root) == [(root / "src/app.py").resolve()]
+    assert run(["--root", str(root), "--no-coverage", "--changed"]) == 0
+    text = (root / ".metrics" / "crap.edn").read_text(encoding="utf-8")
+    assert ':name "kept"' in text
+    assert text.count(":name ") == 1
+
+
+# A project whose own path runs through a folder named like a test folder:
+# (folder the project lives in, its source file, a test file in a test folder inside it).
+_PROJECTS_IN_TEST_FOLDER_NAMES = {
+    "python": (
+        "tests/app",
+        ("src/app/core.py", "def kept():\n    return 1\n"),
+        ("tests/helpers.py", "def helper():\n    return 1\n"),
+    ),
+    "typescript": (
+        "spec/app",
+        ("src/core.ts", "export function kept() {\n  return 1;\n}\n"),
+        ("src/__tests__/helpers.ts", "export function helper() {\n  return 1;\n}\n"),
+    ),
+    "go": (
+        "test/app",
+        ("core.go", "package app\n\nfunc kept() int {\n\treturn 1\n}\n"),
+        ("test/helpers.go", "package test\n\nfunc helper() int {\n\treturn 1\n}\n"),
+    ),
+    "swift": (
+        "MyTests/App",
+        ("Sources/App/App.swift", "func kept() {}\n"),
+        ("AppTests/Helpers.swift", "func helper() {}\n"),
+    ),
+    "kotlin": (
+        "src/androidTest/App",
+        ("app/src/main/kotlin/Board.kt", "fun kept(): Int {\n    return 1\n}\n"),
+        ("app/src/androidTest/kotlin/Helper.kt", "fun helper(): Int {\n    return 1\n}\n"),
+    ),
+    "fsharp": (
+        "Demo.Tests/App",
+        ("Demo/Board.fs", "module Demo.Board\n\nlet kept x = x + 1\n"),
+        ("Demo.Tests/Helper.fs", "module Demo.Helper\n\nlet helper x = x + 1\n"),
+    ),
+}
+
+
+def _project_in_test_folder_name(tmp_path, language):
+    outer, source, test = _PROJECTS_IN_TEST_FOLDER_NAMES[language]
+    root = tmp_path / outer
+    for relative, text in (source, test):
+        _write(root, relative, text)
+    return root, source[0], test[0]
+
+
+@pytest.mark.parametrize("language", sorted(_PROJECTS_IN_TEST_FOLDER_NAMES))
+def test_a_project_inside_a_test_folder_name_keeps_its_sources_but_not_its_tests(
+    tmp_path, language
+):
+    root, source, _test = _project_in_test_folder_name(tmp_path, language)
+    assert iter_source_files([root]) == [(root / source).resolve()]
+
+
+def test_changed_selection_keeps_sources_of_a_project_inside_a_test_folder_name(
+    tmp_path, monkeypatch
+):
+    root, source, test = _project_in_test_folder_name(tmp_path, "python")
+    status = f"?? {source}\0?? {test}\0"
+    monkeypatch.setattr("crapper.cli.subprocess.run", _git_status(root, status))
+    assert run(["--root", str(root), "--no-coverage", "--changed"]) == 0
+    text = (root / ".metrics" / "crap.edn").read_text(encoding="utf-8")
+    assert ':name "kept"' in text
+    assert "helper" not in text
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["tests"],
+        ["app/src/androidTest"],
+        ["-s", "app/src/androidTest"],
+        ["-s", "app/src/androidTest/kotlin"],
+    ],
+)
+def test_a_path_inside_a_test_folder_of_the_project_selects_nothing(
+    tmp_path, monkeypatch, args
+):
+    for relative in (
+        "tests/helpers.py",
+        "app/src/androidTest/kotlin/Helper.kt",
+    ):
+        _write(tmp_path, relative, "x\n")
+    monkeypatch.chdir(tmp_path)
+    assert select_files(parse_args(["--root", str(tmp_path), *args])) == []
+
+
+def test_a_source_root_named_src_still_skips_its_kotlin_test_source_sets(tmp_path, monkeypatch):
+    _write(tmp_path, "app/src/main/kotlin/Board.kt", "fun kept() = 1\n")
+    _write(tmp_path, "app/src/androidTest/kotlin/Helper.kt", "fun helper() = 1\n")
+    monkeypatch.chdir(tmp_path)
+    selected = select_files(parse_args(["--root", str(tmp_path), "-s", "app/src"]))
+    assert selected == [(tmp_path / "app/src/main/kotlin/Board.kt").resolve()]
+
+
 def test_threshold_equal_to_the_score_is_allowed(tmp_path):
     _write(tmp_path, "src/demo/core.clj", "(ns demo.core)\n\n(defn choose [] 1)\n")
     lcov = tmp_path / "target" / "coverage" / "lcov.info"
@@ -490,3 +744,13 @@ def test_changed_functions_reports_nothing_for_an_edit_outside_every_function(tm
     assert run(["--root", str(tmp_path), "--no-coverage", "--changed-functions"]) == 0
     assert "kept" not in capsys.readouterr().out
     assert ':name "kept"' in (tmp_path / ".metrics" / "crap.edn").read_text(encoding="utf-8")
+
+
+def test_a_directory_outside_the_project_root_is_judged_from_itself(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    other = tmp_path / "tests" / "app"
+    _write(other, "src/core.py", "def kept():\n    return 1\n")
+    _write(other, "tests/helpers.py", "def helper():\n    return 1\n")
+    selected = select_files(parse_args(["--root", str(project), str(other)]))
+    assert selected == [(other / "src/core.py").resolve()]
