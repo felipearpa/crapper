@@ -3,6 +3,7 @@ from crapper.coverage import (
     CoverageBundle,
     go_percent,
     load_bundle,
+    load_reports,
     parse_form_coverage,
     parse_go_profile,
     parse_jacoco_index,
@@ -161,24 +162,6 @@ def test_load_bundle_merges_each_report(tmp_path):
     assert bundle.jacoco is not None
 
 
-def test_load_bundle_reads_swifts_lcov_but_nothing_below_the_swift_folder(tmp_path):
-    coverage = tmp_path / "target" / "coverage"
-    swift = coverage / "swift"
-    stray = swift / "DerivedData" / "SourcePackages" / "checkouts" / "Dep"
-    stray.mkdir(parents=True)
-    (swift / "lcov.info").write_text("SF:/app/App.swift\nDA:1,1\nend_of_record\n", encoding="utf-8")
-    (stray / "lcov.info").write_text("SF:/dep/Dep.swift\nDA:1,1\nend_of_record\n", encoding="utf-8")
-    forms = '<span title="1 out of 2 forms covered">   4&nbsp;&nbsp;(if x 1)</span>'
-    (stray / "index.html").write_text(forms, encoding="utf-8")
-    (swift / "report.html").write_text(forms, encoding="utf-8")
-    rust = coverage / "rust" / "nested"
-    rust.mkdir(parents=True)
-    (rust / "lcov.info").write_text("SF:src/lib.rs\nDA:1,1\nend_of_record\n", encoding="utf-8")
-    bundle = load_bundle(tmp_path)
-    assert sorted(bundle.lcov) == ["/app/App.swift", "src/lib.rs"]
-    assert bundle.form_html == {"swift/report": {4: (1, 2)}}
-
-
 def _cobertura(filename, lines, name="Demo.Board"):
     """One Cobertura report with one class; `lines` are (number, hits, "covered/total" or None)."""
 
@@ -196,7 +179,7 @@ def _cobertura(filename, lines, name="Demo.Board"):
 
 
 def _write_cobertura(root, project, text):
-    report = root / "target" / "coverage" / "fsharp" / project / "4f2c" / "me_host_2026.cobertura.xml"
+    report = root / "reports" / project / "4f2c" / "me_host_2026.cobertura.xml"
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text(text, encoding="utf-8")
 
@@ -209,7 +192,7 @@ def _fsharp_percent(root, start_line, end_line, path="src/Board.fs"):
         path=path,
         language="fsharp",
     )
-    return load_bundle(root).percent_for(scored)
+    return load_reports(root, ["reports"], []).percent_for(scored)
 
 
 def test_cobertura_condition_coverage_scores_a_function_and_line_hits_score_a_branchless_one(tmp_path):
@@ -255,7 +238,7 @@ def test_a_line_listed_under_two_classes_of_one_report_merges_like_two_reports(t
 
 def test_a_cobertura_report_beats_an_lcov_info_for_the_same_fsharp_file(tmp_path):
     source = tmp_path / "src" / "Board.fs"
-    lcov = tmp_path / "target" / "coverage" / "fsharp" / "lcov.info"
+    lcov = tmp_path / "reports" / "lcov.info"
     lcov.parent.mkdir(parents=True)
     lcov.write_text("SF:src/Board.fs\nDA:3,5\nend_of_record\n", encoding="utf-8")
     _write_cobertura(tmp_path, "Board.Tests", _cobertura(source, [(3, 0, None)]))
@@ -291,7 +274,7 @@ def test_a_script_function_no_coverage_report_mentions_scores_zero(tmp_path):
     script = tmp_path / "build.fsx"
     script.write_text("let publish target = target\n", encoding="utf-8")
     _write_cobertura(tmp_path, "Board.Tests", _cobertura(board.resolve(), [(3, 1, None)]))
-    found = analyze_files([board, script], tmp_path, load_bundle(tmp_path))
+    found = analyze_files([board, script], tmp_path, load_reports(tmp_path, ["reports"], []))
     assert sorted((entry.name, entry.coverage) for entry in found) == [
         ("place", 100.0),
         ("publish", 0.0),
@@ -326,13 +309,14 @@ def _write_kover(root, folder, classes):
     report = root / folder / "build" / "reports" / "kover" / "report.xml"
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text(_kover(classes), encoding="utf-8")
+    return report
 
 
 def _kotlin_scores(root, source, path="app/src/main/kotlin/demo/Board.kt"):
     file = root / path
     file.parent.mkdir(parents=True, exist_ok=True)
     file.write_text(source, encoding="utf-8")
-    found = analyze_files([file], root, load_bundle(root))
+    found = analyze_files([file], root, load_reports(root, ["build/reports/kover/report.xml"], []))
     return [(entry.namespace, entry.name, entry.coverage) for entry in found]
 
 
@@ -386,34 +370,62 @@ def test_a_kotlin_function_sums_every_report_method_named_after_it_in_its_jvm_cl
 
 
 def test_a_kotlin_function_whose_class_is_absent_from_the_report_scores_zero(tmp_path):
-    _write_kover(tmp_path, ".", {"demo/Other": [("place", 0, 5), ("tick", 0, 5)]})
+    # The file's top-level class is in the report, so Kotlin is matched and not N/A.
+    _write_kover(
+        tmp_path, ".", {"demo/BoardKt": [("helper", 0, 5)], "demo/Other": [("place", 0, 5), ("tick", 0, 5)]}
+    )
     scores = {name: coverage for _namespace, name, coverage in _kotlin_scores(tmp_path, _BOARD_KT)}
     assert scores == {"place": 0.0, "tick": 0.0, "show": 0.0, "clear": 0.0}
 
 
-def test_kover_reports_at_the_root_and_two_levels_down_merge_with_jacoco(tmp_path):
-    _write_kover(tmp_path, ".", {"demo/BoardKt": [("place", 0, 4)]})
-    _write_kover(tmp_path, "app", {"demo/Board": [("tick", 1, 1)]})
-    _write_kover(tmp_path, "data/feature", {"demo/Board": [("clear", 3, 1)]})
-    jacoco = tmp_path / "target" / "site" / "jacoco" / "jacoco.xml"
-    jacoco.parent.mkdir(parents=True)
-    jacoco.write_text(
+def _legacy_java(root):
+    legacy = root / "src" / "demo" / "Legacy.java"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("package demo;\nclass Legacy {\n  void run() { }\n}\n", encoding="utf-8")
+    return legacy
+
+
+def _jacoco_report(path):
+    path.parent.mkdir(parents=True)
+    path.write_text(
         '<report><class name="demo/Legacy"><method name="run" line="3">'
         '<counter type="INSTRUCTION" missed="0" covered="2"/></method></class></report>',
         encoding="utf-8",
     )
-    legacy = tmp_path / "src" / "demo" / "Legacy.java"
-    legacy.parent.mkdir(parents=True)
-    legacy.write_text("package demo;\nclass Legacy {\n  void run() { }\n}\n", encoding="utf-8")
-    board = tmp_path / "app" / "src" / "main" / "kotlin" / "demo" / "Board.kt"
+    return path
+
+
+def _board_kt(root):
+    board = root / "app" / "src" / "main" / "kotlin" / "demo" / "Board.kt"
     board.parent.mkdir(parents=True)
     board.write_text(_BOARD_KT, encoding="utf-8")
-    found = analyze_files([board, legacy], tmp_path, load_bundle(tmp_path))
+    return board
+
+
+def test_kover_reports_given_by_path_merge_with_a_jacoco_report(tmp_path):
+    given = [
+        _write_kover(tmp_path, ".", {"demo/BoardKt": [("place", 0, 4)]}),
+        _write_kover(tmp_path, "app", {"demo/Board": [("tick", 1, 1)]}),
+        _write_kover(tmp_path, "data/feature", {"demo/Board": [("clear", 3, 1)]}),
+        _jacoco_report(tmp_path / "target" / "site" / "jacoco" / "jacoco.xml"),
+    ]
+    legacy = _legacy_java(tmp_path)
+    board = _board_kt(tmp_path)
+    bundle = load_reports(tmp_path, [str(path) for path in given], [])
+    found = analyze_files([board, legacy], tmp_path, bundle)
     scores = {(entry.namespace, entry.name): entry.coverage for entry in found}
     assert scores[("demo", "place")] == 100.0
     assert scores[("demo.Board", "tick")] == 50.0
     assert scores[("demo.Board", "clear")] == 25.0
     assert scores[("demo.Legacy", "run")] == 100.0
+
+
+def test_jacocos_own_locations_still_score_java_without_a_given_path(tmp_path):
+    _jacoco_report(tmp_path / "target" / "site" / "jacoco" / "jacoco.xml")
+    nested = _legacy_java(tmp_path / "api")
+    _jacoco_report(tmp_path / "api" / "target" / "site" / "jacoco" / "jacoco.xml")
+    found = analyze_files([_legacy_java(tmp_path), nested], tmp_path, load_bundle(tmp_path))
+    assert [entry.coverage for entry in found] == [100.0, 100.0]
 
 
 def test_an_interface_default_function_scores_from_the_interface_not_its_default_impls_bridge(tmp_path):

@@ -1,7 +1,8 @@
 """Run each language's coverage tool, then leave the reports for the loader.
 
 Failures are reported and do not stop analysis. A language with no coverage
-tool, or a failed run, scores its functions at 0%.
+tool, or a failed run, scores its functions at 0%. F#, Kotlin, and Swift have
+no run: their coverage comes only from reports passed with `--coverage-report`.
 """
 
 from __future__ import annotations
@@ -14,8 +15,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from crapper.discover import DOTNET_BUILD_DIRS, SKIP_DIRS, is_test_file, language_of
-from crapper.languages import swift_coverage
+from crapper.discover import is_test_file, language_of
 
 _MAVEN = [
     "mvn",
@@ -573,176 +573,6 @@ def _cover_rust(root: Path, files: list[Path]) -> None:
             _warn(f"Rust coverage exited {code} in {module}. Rust coverage will score 0%.")
 
 
-_DOTNET_PROJECTS = (".fsproj", ".csproj", ".vbproj")
-_TEST_SDK = "Microsoft.NET.Test.Sdk"
-
-
-def dotnet_test_projects(root: Path) -> list[Path]:
-    """Project files that reference Microsoft.NET.Test.Sdk, which ships the coverage collector."""
-
-    found: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [
-            name for name in dirnames if name not in SKIP_DIRS and name not in DOTNET_BUILD_DIRS
-        ]
-        for name in filenames:
-            path = Path(dirpath) / name
-            if path.suffix in _DOTNET_PROJECTS and _TEST_SDK in path.read_text(
-                encoding="utf-8", errors="replace"
-            ):
-                found.append(path)
-    return sorted(found)
-
-
-def dotnet_coverage_command(project: Path, results: Path) -> list[str]:
-    return [
-        "dotnet",
-        "test",
-        str(project),
-        "--collect:Code Coverage;Format=cobertura",
-        "--results-directory",
-        str(results),
-    ]
-
-
-def _dotnet_results_dir(coverage: Path, root: Path, project: Path) -> Path:
-    slug = project.relative_to(root).with_suffix("").as_posix().replace("/", "__")
-    return coverage / slug
-
-
-def _cover_fsharp(root: Path) -> None:
-    """Run each .NET test project; old reports go first, so a skipped run scores 0%."""
-
-    coverage = root / "target" / "coverage" / "fsharp"
-    _clean_dir(coverage)
-    if not shutil.which("dotnet"):
-        _warn("dotnet is not installed. F# coverage will score 0%.")
-        return
-    projects = dotnet_test_projects(root)
-    if not projects:
-        _warn("No .NET test project references Microsoft.NET.Test.Sdk; skipping F# coverage.")
-        return
-    for project in projects:
-        results = _dotnet_results_dir(coverage, root, project)
-        results.mkdir(parents=True, exist_ok=True)
-        code = run_shell(dotnet_coverage_command(project, results), project.parent)
-        if code == 0:
-            continue
-        if any(results.rglob("*.cobertura.xml")):
-            _warn(f"F# tests exited {code} in {project}. Coverage was still recorded.")
-        else:
-            _warn(f"F# coverage exited {code} in {project}. F# coverage will score 0%.")
-
-
-_GRADLE_SETTINGS = ("settings.gradle.kts", "settings.gradle")
-_GRADLE_BUILDS = ("build.gradle.kts", "build.gradle")
-_KOVER_NAMES = ("org.jetbrains.kotlinx.kover", "kotlinx.kover")
-_KOVER_REPORTS = (  # must match the Kover globs coverage._merge_jacoco reads
-    "build/reports/kover/report.xml",
-    "*/build/reports/kover/report.xml",
-    "*/*/build/reports/kover/report.xml",
-)
-_KOVER_LINES = """\
-  root build file:  plugins { id("org.jetbrains.kotlinx.kover") version "0.9.10" }
-                    dependencies { kover(project(":<module>")) }  (one per module)
-  each module:      plugins { id("org.jetbrains.kotlinx.kover") }"""
-
-
-def _gradle_roots(root: Path, files: list[Path]) -> list[Path]:
-    """The Gradle builds that hold the Kotlin files, by their settings file."""
-
-    found: set[Path] = set()
-    root = root.resolve()
-    for file in files:
-        if Path(file).suffix != ".kt":
-            continue
-        for marker in _GRADLE_SETTINGS:
-            build = nearest_marker(Path(file), marker, root)
-            if build is not None:
-                found.add(build.resolve())
-                break
-    return sorted(found)
-
-
-def _applies_kover(build: Path) -> bool:
-    for name in _GRADLE_BUILDS:
-        path = build / name
-        if path.is_file():
-            text = path.read_text(encoding="utf-8", errors="replace")
-            return any(kover in text for kover in _KOVER_NAMES)
-    return False
-
-
-def _gradle_command(build: Path) -> list[str] | None:
-    wrapper = build / "gradlew"
-    if wrapper.is_file():
-        return [str(wrapper), ":koverXmlReport"]
-    if shutil.which("gradle"):
-        return ["gradle", ":koverXmlReport"]
-    return None
-
-
-def _remove_kover_reports(root: Path) -> None:
-    """The root and one and two levels down, where the loader reads them."""
-
-    for pattern in _KOVER_REPORTS:
-        for report in root.glob(pattern):
-            report.unlink(missing_ok=True)
-
-
-def _cover_kotlin(root: Path, files: list[Path]) -> None:
-    """Run Kover's merged report in each Gradle root.
-
-    Every Kover report the loader reads goes first, so a skipped or failed run
-    scores 0% instead of scoring from a stale module report.
-    """
-
-    _remove_kover_reports(root)
-    builds = _gradle_roots(root, files)
-    if not builds:
-        _warn("No settings.gradle.kts or settings.gradle; skipping Kotlin coverage.")
-        return
-    for build in builds:
-        if not _applies_kover(build):
-            _warn(
-                f"The Kover plugin is not applied in {build}. Kotlin coverage will score 0%. "
-                f"Add it to the root build file and to each module:\n{_KOVER_LINES}"
-            )
-            continue
-        command = _gradle_command(build)
-        if command is None:
-            _warn(f"No gradlew in {build} and gradle is not installed. Kotlin coverage will score 0%.")
-            continue
-        code = run_shell(command, build)
-        if code != 0:
-            _warn(f"Kotlin coverage exited {code} in {build}. Kotlin coverage will score 0%.")
-
-
-def _cover_swift(root: Path) -> None:
-    """crapper never starts a Swift test run; without a command Swift scores 0%."""
-
-    swift_coverage.remove_lcov(root)
-    _warn(
-        "Swift coverage needs --coverage-command with an Xcode or swift test command that "
-        f"leaves its coverage in {root / swift_coverage.COVERAGE_DIR}. "
-        "Swift coverage will score 0%. For example, for an Xcode project:\n"
-        f"  crapper --coverage-command '{swift_coverage.XCODE_COMMAND}'\n"
-        "or for a Swift package:\n"
-        f"  crapper --coverage-command '{swift_coverage.PACKAGE_COMMAND}'"
-    )
-
-
-def _after_command(root: Path, files: list[Path], code: int) -> None:
-    """Convert Swift coverage after the command; a failed one leaves no Swift LCOV."""
-
-    if "swift" not in _languages_in(files):
-        return
-    if code == 0:
-        swift_coverage.convert(root, files)
-    else:
-        swift_coverage.remove_lcov(root)
-
-
 def run_coverage(root: Path, files: list[Path], command: str | None) -> int:
     """Generate coverage reports for the languages present in `files`.
 
@@ -754,7 +584,6 @@ def run_coverage(root: Path, files: list[Path], command: str | None) -> int:
     root = root.resolve()
     if command:
         code = run_shell(command, root)
-        _after_command(root, files, code)
         if code != 0:
             _warn(
                 f"Coverage command exited {code}. "
@@ -775,10 +604,4 @@ def run_coverage(root: Path, files: list[Path], command: str | None) -> int:
         _cover_python(root, files)
     if "rust" in languages:
         _cover_rust(root, files)
-    if "fsharp" in languages:
-        _cover_fsharp(root)
-    if "kotlin" in languages:
-        _cover_kotlin(root, files)
-    if "swift" in languages:
-        _cover_swift(root)
     return 0

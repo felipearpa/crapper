@@ -31,7 +31,9 @@ def render_edn(entries: list[Entry]) -> str:
     """EDN map `{:entries [...]}` with crap4clj's keys, in crap4clj's order.
 
     uml-viewer groups this file by `:namespace` and joins each operation on
-    `:name`. Coverage is a percentage. `nil` coverage and CRAP mean `--no-coverage`.
+    `:name`. Coverage is a percentage. `nil` coverage and CRAP mean `--no-coverage`,
+    F#, Kotlin, or Swift without `--coverage-report`, or a language no report
+    given with `--coverage-report` matches.
     A function absent from the report is `0.0`, not `nil`.
     """
 

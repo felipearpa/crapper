@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from crapper.analyze import analyze_files
-from crapper.coverage import CoverageBundle, load_bundle
+from crapper.coverage import CoverageBundle, ReportPathError, load_bundle, load_reports
 from crapper.discover import (
     CLOJURE_TEST_SUFFIXES,
     DOTNET_TEST_DIR_SUFFIXES,
@@ -71,6 +71,57 @@ Options:
   --use-existing-coverage       Read coverage already on disk. Do not rerun tests.
   --coverage-command <cmd>      Run this command instead of the per-language
                                 coverage tools, then read the reports it wrote.
+  --coverage-report <path>      Read coverage from this report file, or from
+                                every report in this folder, and run no test
+                                and no command. A relative path is read inside
+                                the project root. May be repeated. Reports are
+                                told by content, not name:
+                                  a folder holding Build/ProfileData/*/
+                                    *.profdata, directly or one folder
+                                    down: Xcode derived data
+                                  XML whose root is coverage: Cobertura
+                                  XML whose root is report: JaCoCo or Kover
+                                  text with SF: records: LCOV
+                                  text starting with mode: Go profile
+                                  JSON of type llvm.coverage.json.export:
+                                    a swift test export
+                                Derived data and exports are converted in
+                                memory; nothing is written. Derived data is
+                                not searched for other reports. Swift inputs
+                                add up line by line, in any order. In a
+                                folder, other files are skipped quietly.
+                                Reports combine: Cobertura and Swift line by
+                                line; the last LCOV record of a file wins;
+                                JaCoCo and Kover methods and Go segments add
+                                up; Cobertura beats LCOV; a file reached twice
+                                is read once. A path that does not exist or
+                                holds no report, or a report named directly
+                                that cannot be parsed, or derived data that
+                                cannot be converted (no xcrun, llvm-cov
+                                failing, no test bundle beside the profile),
+                                stops crapper with exit 1, no table, and
+                                .metrics/crap.edn as it was; a damaged report
+                                inside a folder is skipped with a warning.
+                                Cannot be combined with --no-coverage or
+                                --coverage-command; with --use-existing-coverage
+                                it behaves as it does alone.
+                                A language none of whose scored files is in
+                                a given report shows coverage and CRAP as N/A,
+                                in the table and .metrics/crap.edn, with one
+                                hint on stderr naming the reports to pass for
+                                it. Once one of its files is in a report, a
+                                function the reports leave out scores 0%.
+                                Warnings, after which the table still prints:
+                                  "matches none of the files being scored":
+                                    no report at that path holds a scored
+                                    file, as with a report from another
+                                    checkout or project.
+                                  "branch lines that ran and carry no
+                                    condition-coverage", once per Cobertura
+                                    report: a merged solution-wide dotnet
+                                    test report, which scores wrongly; run
+                                    dotnet test with
+                                    VSTEST_DISABLE_ARTIFACTS_POSTPROCESSING=1.
   --threshold <number>          Exit 2 when the worst CRAP score is above this.
 
 Arguments:
@@ -97,25 +148,22 @@ Coverage, when it is produced:
   TypeScript   npm run coverage, Vitest's own LCOV, or c8 around npm test
   Rust         cargo llvm-cov, or cargo tarpaulin, in the nearest Cargo.toml
   Python       coverage.py LCOV, via pytest or unittest, per project
-  F#           dotnet test Cobertura coverage, per .NET test project
-  Kotlin       gradlew :koverXmlReport in the Gradle root, which must apply
-               the Kover plugin; build/reports/kover/report.xml
-  Swift        only with --coverage-command: an Xcode test run with coverage
-               and its derived data in target/coverage/swift/, whose profile
-               crapper converts with llvm-cov, or a swift test export copied
-               there; both go to target/coverage/swift/lcov.info.
-               Xcode example:
-               --coverage-command 'rm -rf target/coverage/swift &&
-                 xcodebuild test -workspace App.xcworkspace -scheme App \\
-                 -destination "platform=iOS Simulator,name=iPhone 17" \\
-                 -enableCodeCoverage YES \\
-                 -derivedDataPath target/coverage/swift/DerivedData'
-               Swift package example:
-               --coverage-command 'rm -rf target/coverage/swift &&
-                 mkdir -p target/coverage/swift &&
-                 swift test --enable-code-coverage &&
-                 cp "$(swift test --show-codecov-path)" target/coverage/swift/'
-               Without the command, or when it exits non-zero, Swift scores 0%.
+  F#           --coverage-report <the Cobertura reports of dotnet test>
+  Kotlin       --coverage-report <Kover's XML report>
+  Swift        --coverage-report <Xcode derived data or a swift test export>,
+               converted in memory with nothing written. Derived data can
+               lie anywhere, such as Xcode's default folder:
+               --coverage-report ~/Library/Developer/Xcode/DerivedData/App-abc
+               or the folder given to xcodebuild test -enableCodeCoverage YES
+               -derivedDataPath <path>; a swift test export is the file
+               swift test --show-codecov-path names after
+               swift test --enable-code-coverage.
+               F#, Kotlin, and Swift get coverage only from that option:
+               crapper starts no dotnet, Gradle, or Xcode run for them and
+               reads none of their reports from a place of its own, such as
+               target/coverage/ or build/reports/kover/. Without the option
+               their coverage and CRAP are N/A, with one hint for each,
+               except under --no-coverage.
 
 uml-viewer joins .metrics/crap.edn on :namespace and :name.
   Clojure      the ns, and the defn name
@@ -141,6 +189,7 @@ class Options:
     no_coverage: bool = False
     use_existing_coverage: bool = False
     coverage_command: str | None = None
+    coverage_reports: list[str] = field(default_factory=list)
     threshold: float | None = None
     changed: bool = False
     changed_functions: bool = False
@@ -185,6 +234,9 @@ def _read_option(options: Options, args: list[str], index: int) -> int:
     if arg in {"-s", "--source-root"}:
         options.source_roots.append(_take(args, index, arg))
         return index + 2
+    if arg == "--coverage-report":
+        options.coverage_reports.append(_take(args, index, arg))
+        return index + 2
     if arg in _VALUES:
         name, convert = _VALUES[arg]
         setattr(options, name, convert(_take(args, index, arg), arg))
@@ -198,6 +250,10 @@ def _read_option(options: Options, args: list[str], index: int) -> int:
 def _conflict(options: Options) -> str | None:
     if options.no_coverage and options.coverage_command:
         return "--no-coverage cannot be combined with --coverage-command"
+    if options.coverage_reports and options.no_coverage:
+        return "--coverage-report cannot be combined with --no-coverage"
+    if options.coverage_reports and options.coverage_command:
+        return "--coverage-report cannot be combined with --coverage-command"
     return None
 
 
@@ -436,12 +492,48 @@ def _show_help(options: Options) -> int:
 def _coverage_bundle(options: Options, root: Path, files: list[Path]):
     if options.no_coverage:
         return None
+    if options.coverage_reports:
+        return load_reports(root, options.coverage_reports, files)
     if options.use_existing_coverage:
         return load_bundle(root)
     status = run_coverage(root, files, options.coverage_command)
     if options.coverage_command and status not in (0, None):
         return CoverageBundle()
     return load_bundle(root)
+
+
+# The name and the reports `--coverage-report` reads for each language.
+_REPORTS_FOR = {
+    "clojure": ("Clojure", "an LCOV report"),
+    "java": ("Java", "a JaCoCo XML report"),
+    "go": ("Go", "a Go coverage profile"),
+    "typescript": ("TypeScript", "an LCOV report"),
+    "rust": ("Rust", "an LCOV or Cobertura report"),
+    "python": ("Python", "an LCOV or Cobertura report"),
+    "fsharp": ("F#", "the Cobertura reports of dotnet test"),
+    "kotlin": ("Kotlin", "Kover's XML report"),
+    "swift": ("Swift", "Xcode derived data or a swift test export"),
+}
+
+
+def _print_hints(entries: list[Entry], given: bool) -> None:
+    """One hint for each language whose functions all lack coverage although coverage was asked for.
+
+    `given` says whether report paths were given: then none matched the
+    language's files; otherwise the language reads coverage only from them.
+    """
+
+    covered = {entry.language for entry in entries if entry.coverage is not None}
+    for language in sorted({entry.language for entry in entries} - covered):
+        name, reports = _REPORTS_FOR.get(language, (language, "a coverage report"))
+        if given:
+            reason = "no coverage report given matches its files"
+        else:
+            reason = f"crapper reads {name} coverage only from --coverage-report"
+        print(
+            f"{name}: coverage and CRAP show N/A; {reason}. Pass --coverage-report <{reports}>.",
+            file=sys.stderr,
+        )
 
 
 def _threshold_status(options: Options, entries) -> int:
@@ -473,10 +565,17 @@ def run(argv: list[str] | None = None) -> int:
         print("No source files to analyze.")
         return 0
 
-    entries = analyze_files(files, root, _coverage_bundle(options, root, files))
+    try:
+        bundle = _coverage_bundle(options, root, files)
+    except ReportPathError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    entries = analyze_files(files, root, bundle)
     metrics = write_metrics(entries, root)
     shown = entries if changes is None else touched_entries(entries, root, changes)
     print(format_report(shown), end="", flush=True)
+    if bundle is not None:
+        _print_hints(entries, given=bundle.given is not None)
     print(f"Wrote {metrics}", file=sys.stderr)
     return _threshold_status(options, shown)
 

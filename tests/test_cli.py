@@ -1,4 +1,6 @@
+import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -15,6 +17,7 @@ from crapper.cli import (
     run,
     select_files,
 )
+from crapper import runners
 from crapper.discover import is_test_file, iter_source_files, language_of
 
 
@@ -63,10 +66,11 @@ def test_swift_sources_are_swift_and_manifests_tests_and_build_folders_are_not_s
     assert is_test_file("shared/CoreTests/kotlin/Board.kt") is False
 
 
-def _write(root: Path, relative: str, source: str) -> None:
+def _write(root: Path, relative: str, source: str) -> Path:
     path = root / relative
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(source, encoding="utf-8")
+    return path
 
 
 class _Completed:
@@ -754,3 +758,567 @@ def test_a_directory_outside_the_project_root_is_judged_from_itself(tmp_path):
     _write(other, "tests/helpers.py", "def helper():\n    return 1\n")
     selected = select_files(parse_args(["--root", str(project), str(other)]))
     assert selected == [(other / "src/core.py").resolve()]
+
+
+def _one_line_cobertura(filename: str, line: int, hits: int) -> str:
+    """A Cobertura report as `dotnet test` writes it, byte-order mark first."""
+
+    return (
+        '﻿<?xml version="1.0" encoding="utf-8"?>\n<coverage><packages><package name="Demo">'
+        f'<classes><class name="Demo" filename="{filename}"><methods/><lines>'
+        f'<line number="{line}" hits="{hits}" branch="False" /></lines></class></classes>'
+        "</package></packages></coverage>"
+    )
+
+
+def _snapshot_coverage(root: Path, name: str) -> str:
+    text = (root / ".metrics" / "crap.edn").read_text(encoding="utf-8")
+    return re.search(rf':name "{name}", [^}}]*:coverage ([^,]+),', text).group(1)
+
+
+def test_coverage_report_paths_score_from_their_reports_and_run_nothing(tmp_path, monkeypatch):
+    root = tmp_path / "project"
+    for module in ("Board", "Other", "Stale"):
+        _write(root, f"Demo/{module}.fs", f"module Demo.{module}\n\nlet {module.lower()} x = x + 1\n")
+    _write(root, "reports/unit.xml", _one_line_cobertura(str(root / "Demo/Board.fs"), 3, 1))
+    elsewhere = tmp_path / "elsewhere"
+    _write(elsewhere, "any-name.txt", _one_line_cobertura(str(root / "Demo/Other.fs"), 3, 1))
+    _write(elsewhere, "notes.txt", "not a report\n")
+    _write(
+        root,
+        "target/coverage/fsharp/old/me.cobertura.xml",
+        _one_line_cobertura(str(root / "Demo/Stale.fs"), 3, 1),
+    )
+    called = []
+    monkeypatch.setattr("crapper.cli.run_coverage", lambda *args, **_kwargs: called.append(args))
+    monkeypatch.chdir(tmp_path)
+
+    code = run(
+        [
+            "--root",
+            str(root),
+            "--coverage-report",
+            "reports/unit.xml",
+            "--coverage-report",
+            str(elsewhere),
+        ]
+    )
+
+    assert code == 0
+    assert called == []
+    assert _snapshot_coverage(root, "board") == "100.0"
+    assert _snapshot_coverage(root, "other") == "100.0"
+    assert _snapshot_coverage(root, "stale") == "0.0"
+
+
+@pytest.mark.parametrize("given", ["missing", "empty"])
+def test_a_coverage_report_path_with_no_report_stops_before_scoring(tmp_path, capsys, given):
+    _write(tmp_path, "Demo/Board.fs", "module Demo.Board\n\nlet board x = x + 1\n")
+    (tmp_path / "empty").mkdir()
+    assert run(["--root", str(tmp_path), "--no-coverage"]) == 0
+    snapshot = tmp_path / ".metrics" / "crap.edn"
+    before = snapshot.read_text(encoding="utf-8")
+    capsys.readouterr()
+
+    code = run(["--root", str(tmp_path), "--coverage-report", given])
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert str(tmp_path / given) in captured.err
+    assert "--coverage-report" in captured.err
+    assert "CRAP Report" not in captured.out
+    assert snapshot.read_text(encoding="utf-8") == before
+
+
+_JACOCO_WITH_DOCTYPE = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<!DOCTYPE report PUBLIC "-//JACOCO//DTD Report 1.1//EN" "report.dtd">'
+    '<report name="demo"><package name="demo"><class name="demo/Board">'
+    '<method name="board" desc="(I)I" line="4">'
+    '<counter type="INSTRUCTION" missed="0" covered="4"/></method>'
+    "</class></package></report>"
+)
+
+
+def test_jacoco_lcov_and_go_reports_are_told_by_content_whatever_their_name(tmp_path):
+    _write(
+        tmp_path,
+        "src/main/java/demo/Board.java",
+        "package demo;\n\npublic class Board {\n    public int board(int x) {\n        return x + 1;\n    }\n}\n",
+    )
+    _write(tmp_path, "app.py", "def app(x):\n    return x + 1\n")
+    _write(tmp_path, "walk.go", "package demo\n\nfunc walk(x int) int {\n\treturn x + 1\n}\n")
+    _write(tmp_path, "given/one.data", _JACOCO_WITH_DOCTYPE)
+    _write(tmp_path, "given/two.data", "TN:\nSF:app.py\nDA:2,1\nend_of_record\n")
+    _write(tmp_path, "elsewhere/three.data", "mode: set\nwalk.go:3.27,5.2 1 1\n")
+
+    code = run(
+        ["--root", str(tmp_path), "--coverage-report", "given", "--coverage-report", "elsewhere/three.data"]
+    )
+
+    assert code == 0
+    assert _snapshot_coverage(tmp_path, "board") == "100.0"
+    assert _snapshot_coverage(tmp_path, "app") == "100.0"
+    assert _snapshot_coverage(tmp_path, "walk") == "100.0"
+
+
+def test_given_reports_merge_as_the_fixed_locations_do_and_each_file_is_read_once(tmp_path, capsys):
+    _write(tmp_path, "Demo/Board.fs", "module Demo.Board\n\nlet board x =\n    x + 1\n")
+    _write(tmp_path, "reports/a.xml", _one_line_cobertura(str(tmp_path / "Demo/Board.fs"), 4, 1))
+    _write(tmp_path, "reports/b.xml", _one_line_cobertura(str(tmp_path / "Demo/Board.fs"), 4, 0))
+    _write(tmp_path, "reports/z.info", "SF:Demo/Board.fs\nDA:4,0\nend_of_record\n")
+    _write(tmp_path, "reports/nested/half.xml", "<coverage><packages><pack")
+    _write(tmp_path, "reports/nested/other.info", "SF:Demo/Other.fs\nDA:1,1\nend_of_record\n")
+
+    code = run(
+        [
+            "--root",
+            str(tmp_path),
+            "--coverage-report",
+            "reports/a.xml",
+            "--coverage-report",
+            "reports",
+            "--coverage-report",
+            "reports/nested",
+        ]
+    )
+
+    assert code == 0
+    assert _snapshot_coverage(tmp_path, "board") == "100.0"
+    assert capsys.readouterr().err.count("half.xml") == 1
+
+
+_DAMAGED = {
+    "cobertura": ("half.xml", "<coverage><packages><pack"),
+    "jacoco": ("half.xml", '<?xml version="1.0"?><!DOCTYPE report><report name="demo"><pack'),
+    "go": ("half.out", "mode: set\nwalk.go:3.27"),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_DAMAGED))
+def test_a_damaged_report_alone_stops_crapper_and_in_a_folder_is_skipped_with_a_warning(
+    tmp_path, capsys, kind
+):
+    name, text = _DAMAGED[kind]
+    _write(tmp_path, "Demo/Board.fs", "module Demo.Board\n\nlet board x = x + 1\n")
+    _write(tmp_path, f"reports/{name}", text)
+    _write(tmp_path, "reports/good.xml", _one_line_cobertura(str(tmp_path / "Demo/Board.fs"), 3, 1))
+    _write(tmp_path, f"broken/{name}", text)
+
+    alone = run(["--root", str(tmp_path), "--coverage-report", f"reports/{name}"])
+    alone_err = capsys.readouterr()
+    folder_then_file = run(
+        ["--root", str(tmp_path), "--coverage-report", "reports", "--coverage-report", f"reports/{name}"]
+    )
+    folder_then_file_err = capsys.readouterr()
+    only_damaged = run(["--root", str(tmp_path), "--coverage-report", "broken"])
+    only_damaged_err = capsys.readouterr().err
+    in_folder = run(["--root", str(tmp_path), "--coverage-report", "reports"])
+    in_folder_err = capsys.readouterr().err
+
+    assert alone == 1
+    assert str(tmp_path / "reports" / name) in alone_err.err
+    assert "CRAP Report" not in alone_err.out
+    assert f"{name}: unreadable" in alone_err.err and "skipped" not in alone_err.err
+    assert folder_then_file == 1
+    assert f"--coverage-report {tmp_path / 'reports' / name}: unreadable" in folder_then_file_err.err
+    assert "CRAP Report" not in folder_then_file_err.out
+    assert only_damaged == 1
+    assert str(tmp_path / "broken") in only_damaged_err
+    assert in_folder == 0
+    assert f"{name}: unreadable" in in_folder_err and "skipped" in in_folder_err
+    assert _snapshot_coverage(tmp_path, "board") == "100.0"
+    assert "Traceback" not in alone_err.err + folder_then_file_err.err + only_damaged_err + in_folder_err
+
+
+@pytest.mark.parametrize("other", [["--no-coverage"], ["--coverage-command", "true"]])
+def test_a_coverage_report_cannot_be_combined_with_no_coverage_or_a_command(other):
+    options = parse_args(["--coverage-report", "reports", *other])
+
+    assert options.action == "help"
+    assert options.exit_code == 1
+    assert options.message.startswith(f"--coverage-report cannot be combined with {other[0]}")
+
+
+def test_a_coverage_report_with_use_existing_coverage_reads_only_the_given_report(tmp_path, monkeypatch):
+    for module in ("Board", "Stale"):
+        _write(tmp_path, f"Demo/{module}.fs", f"module Demo.{module}\n\nlet {module.lower()} x = x + 1\n")
+    _write(tmp_path, "reports/unit.xml", _one_line_cobertura(str(tmp_path / "Demo/Board.fs"), 3, 1))
+    _write(
+        tmp_path,
+        "target/coverage/fsharp/old/me.cobertura.xml",
+        _one_line_cobertura(str(tmp_path / "Demo/Stale.fs"), 3, 1),
+    )
+    called = []
+    monkeypatch.setattr("crapper.cli.run_coverage", lambda *args, **_kwargs: called.append(args))
+
+    code = run(
+        ["--root", str(tmp_path), "--use-existing-coverage", "--coverage-report", "reports/unit.xml"]
+    )
+
+    assert code == 0
+    assert called == []
+    assert _snapshot_coverage(tmp_path, "board") == "100.0"
+    assert _snapshot_coverage(tmp_path, "stale") == "0.0"
+
+
+_SWIFT_BOARD = "func board(_ x: Int) -> Int {\n    return x + 1\n}\n"
+
+
+def _xcode_derived_data(folder: Path, bundle: bool = True) -> Path:
+    """What `xcodebuild test -enableCodeCoverage YES -derivedDataPath <folder>` leaves."""
+
+    profile = _write(folder, "Build/ProfileData/B2F2EDFE/Coverage.profdata", "profile")
+    if bundle:
+        _write(folder, "Build/Products/Debug-iphonesimulator/BoardTests.xctest/BoardTests", "binary")
+    return profile
+
+
+def _fake_xcrun(monkeypatch, llvm_cov, xcrun: bool = True) -> None:
+    """`xcrun` on the PATH, `lipo` naming one arm64 slice, and `llvm-cov` answering `llvm_cov(command)`."""
+
+    def run(command, **_kwargs):
+        if command[:2] == ["xcrun", "lipo"]:
+            return subprocess.CompletedProcess(command, 0, stdout="arm64\n", stderr="")
+        return llvm_cov(command)
+
+    which = (lambda name: f"/usr/bin/{name}") if xcrun else (lambda name: None)
+    monkeypatch.setattr("crapper.languages.swift_coverage.shutil.which", which)
+    monkeypatch.setattr("crapper.languages.swift_coverage.subprocess.run", run)
+
+
+def _files_under(folder: Path) -> list[Path]:
+    return sorted(path for path in folder.rglob("*") if path.is_file() and ".metrics" not in path.parts)
+
+
+@pytest.mark.parametrize("given", ["coverage/DerivedData", "coverage"])
+def test_xcode_derived_data_converts_directly_or_one_folder_down_and_is_not_searched(
+    tmp_path, monkeypatch, given
+):
+    board = _write(tmp_path, "Board.swift", _SWIFT_BOARD)
+    other = _write(tmp_path, "Other.swift", _SWIFT_BOARD.replace("board", "other"))
+    derived = tmp_path / "coverage" / "DerivedData"
+    _xcode_derived_data(derived)
+    # Report-like files beside the derived data and in a package checkout inside it.
+    lcov = f"SF:{other}\nDA:1,1\nDA:2,1\nDA:3,1\nend_of_record\n"
+    _write(tmp_path, "coverage/lcov.info", lcov)
+    _write(derived, "SourcePackages/checkouts/Lib/Tests/Fixtures/lcov.info", lcov)
+    llvm_cov = f"SF:{board}\nDA:1,2\nDA:2,2\nDA:3,2\nend_of_record\n"
+    _fake_xcrun(monkeypatch, lambda command: subprocess.CompletedProcess(command, 0, stdout=llvm_cov, stderr=""))
+    before = _files_under(tmp_path)
+
+    code = run(["--root", str(tmp_path), "--coverage-report", given])
+
+    assert code == 0
+    assert _snapshot_coverage(tmp_path, "board") == "100.0"
+    assert _snapshot_coverage(tmp_path, "other") == "0.0"
+    assert _files_under(tmp_path) == before
+
+
+def _swift_test_export_text(board: Path) -> str:
+    """A `swift test --enable-code-coverage` export, its type after more than 4 KB of data, as llvm-cov orders it."""
+
+    covered = {"filename": str(board), "segments": [[1, 29, 1, True, True, False], [3, 2, 0, False, False, False]]}
+    padding = [{"filename": f"/elsewhere/Generated{index}.swift", "segments": []} for index in range(200)]
+    return json.dumps(
+        {"data": [{"files": [covered, *padding]}], "type": "llvm.coverage.json.export", "version": "3.0.1"}
+    )
+
+
+def test_a_swift_test_export_is_told_by_content_whatever_its_name_and_needs_no_xcrun(tmp_path, monkeypatch):
+    board = _write(tmp_path, "Sources/Demo/Board.swift", _SWIFT_BOARD)
+    text = _swift_test_export_text(board)
+    assert len(text) > 4096 and "llvm.coverage.json.export" not in text[:4096]
+    _write(tmp_path, "reports/any-name.data", text)
+    _write(tmp_path, "reports/Package.resolved", '{"pins": [], "version": 2}')
+    _fake_xcrun(monkeypatch, lambda command: pytest.fail(f"ran {command}"), xcrun=False)
+    before = _files_under(tmp_path)
+
+    code = run(["--root", str(tmp_path), "--coverage-report", "reports"])
+
+    assert code == 0
+    assert _snapshot_coverage(tmp_path, "board") == "100.0"
+    assert _files_under(tmp_path) == before
+
+
+@pytest.mark.parametrize("cause", ["no xcrun", "llvm-cov fails", "no test bundle"])
+def test_xcode_derived_data_that_cannot_be_converted_stops_crapper_with_the_reason(
+    tmp_path, monkeypatch, capsys, cause
+):
+    _write(tmp_path, "Board.swift", _SWIFT_BOARD)
+    profile = _xcode_derived_data(tmp_path / "DerivedData", bundle=cause != "no test bundle")
+    failed = subprocess.CompletedProcess([], 1, stdout="", stderr="malformed instrumentation profile data")
+    _fake_xcrun(monkeypatch, lambda command: failed, xcrun=cause != "no xcrun")
+
+    code = run(["--root", str(tmp_path), "--coverage-report", "DerivedData"])
+
+    captured = capsys.readouterr()
+    reason = {
+        "no xcrun": "xcrun is not installed",
+        "llvm-cov fails": "llvm-cov exited 1 (malformed instrumentation profile data)",
+        "no test bundle": "no test bundle or app next to it",
+    }[cause]
+    assert code == 1
+    assert f"--coverage-report {tmp_path / 'DerivedData'}: cannot convert Xcode derived data" in captured.err
+    assert reason in captured.err and str(profile) in captured.err
+    assert "CRAP Report" not in captured.out
+    assert "Traceback" not in captured.err
+
+
+def test_a_truncated_swift_test_export_alone_stops_crapper_and_in_a_folder_is_skipped_with_a_warning(
+    tmp_path, monkeypatch, capsys
+):
+    board = _write(tmp_path, "Sources/Demo/Board.swift", _SWIFT_BOARD)
+    text = _swift_test_export_text(board)
+    _write(tmp_path, "reports/good.json", text)
+    # A half-written export has lost the type llvm-cov writes at its end.
+    _write(tmp_path, "reports/half.json", text[:300])
+    _fake_xcrun(monkeypatch, lambda command: pytest.fail(f"ran {command}"), xcrun=False)
+
+    in_folder = run(["--root", str(tmp_path), "--coverage-report", "reports"])
+    in_folder_err = capsys.readouterr().err
+    alone = run(["--root", str(tmp_path), "--coverage-report", "reports/half.json"])
+    alone_err = capsys.readouterr()
+
+    assert in_folder == 0
+    assert f"{tmp_path / 'reports' / 'half.json'}: unreadable" in in_folder_err and "skipped" in in_folder_err
+    assert _snapshot_coverage(tmp_path, "board") == "100.0"
+    assert alone == 1
+    assert f"--coverage-report {tmp_path / 'reports' / 'half.json'}: unreadable" in alone_err.err
+    assert "skipped" not in alone_err.err
+    assert "CRAP Report" not in alone_err.out
+    assert "Traceback" not in in_folder_err + alone_err.err
+
+
+@pytest.mark.parametrize("export_first", [False, True])
+def test_swift_inputs_given_separately_merge_line_by_line_whatever_their_order(
+    tmp_path, monkeypatch, export_first
+):
+    board = _write(tmp_path, "Board.swift", _SWIFT_BOARD)
+    # Derived data covers lines 1 and 2; the export covers lines 2 and 3.
+    _xcode_derived_data(tmp_path / "DerivedData")
+    llvm_cov = f"SF:{board}\nDA:1,1\nDA:2,1\nDA:3,0\nend_of_record\n"
+    _fake_xcrun(monkeypatch, lambda command: subprocess.CompletedProcess(command, 0, stdout=llvm_cov, stderr=""))
+    segments = [[1, 29, 0, True, True, False], [2, 5, 1, True, True, False], [3, 2, 0, False, False, False]]
+    export = {"data": [{"files": [{"filename": str(board), "segments": segments}]}], "type": "llvm.coverage.json.export"}
+    _write(tmp_path, "swift-test.json", json.dumps(export))
+    given = ["DerivedData", "swift-test.json"]
+    if export_first:
+        given.reverse()
+
+    code = run(["--root", str(tmp_path), "--coverage-report", given[0], "--coverage-report", given[1]])
+
+    assert code == 0
+    assert _snapshot_coverage(tmp_path, "board") == "100.0"
+
+
+_KOVER_BOARD = (
+    '<?xml version="1.0" ?><report name="Kover"><package name="demo">'
+    '<class name="demo/Board" sourcefilename="Board.kt">'
+    '<method name="tick" desc="()I"><counter type="INSTRUCTION" missed="0" covered="2"/></method>'
+    "</class></package></report>"
+)
+_BOARD_KT = (
+    "package demo\n\nclass Board {\n    fun tick(): Int {\n        return 1\n    }\n\n"
+    "    fun clear() {\n    }\n}\n"
+)
+
+
+def _table_row(table: str, name: str) -> str:
+    return next(line for line in table.splitlines() if line.startswith(f"{name} "))
+
+
+def test_a_language_no_given_report_matches_shows_na_with_one_hint(tmp_path, capsys):
+    _write(tmp_path, "shared/src/commonMain/kotlin/demo/Board.kt", _BOARD_KT)
+    _write(tmp_path, "iosApp/iosApp/Board.swift", _SWIFT_BOARD)
+    _write(tmp_path, "iosApp/iosApp/Other.swift", _SWIFT_BOARD.replace("board", "other"))
+    _write(tmp_path, "build/reports/kover/report.xml", _KOVER_BOARD)
+
+    code = run(["--root", str(tmp_path), "--coverage-report", "build/reports/kover/report.xml"])
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert _snapshot_coverage(tmp_path, "tick") == "100.0"
+    assert _snapshot_coverage(tmp_path, "clear") == "0.0"
+    assert _snapshot_coverage(tmp_path, "board") == "nil"
+    assert _snapshot_coverage(tmp_path, "other") == "nil"
+    assert re.search(r':name "board", [^}]*:crap nil', (tmp_path / ".metrics" / "crap.edn").read_text("utf-8"))
+    assert _table_row(captured.out, "board").split()[-2:] == ["N/A", "N/A"]
+    assert _table_row(captured.out, "clear").split()[-2] == "0.0%"
+    assert captured.err.count("--coverage-report <") == 1
+    assert "Swift: coverage and CRAP show N/A; no coverage report given matches its files." in captured.err
+    assert "Kotlin:" not in captured.err
+
+
+def test_changed_functions_score_from_a_report_path_relative_to_the_folder_crapper_runs_in(
+    tmp_path, monkeypatch, capsys
+):
+    _repo_with_one_edited_function(tmp_path)
+    _write(tmp_path, "reports/lcov.info", "SF:app.py\nDA:2,1\nDA:3,1\nDA:4,0\nend_of_record\n")
+    monkeypatch.chdir(tmp_path)
+
+    code = run(["--changed-functions", "--coverage-report", "reports/lcov.info"])
+
+    table = capsys.readouterr().out
+    assert code == 0
+    assert _table_row(table, "edited").split()[-2] == "66.7%"
+    assert "untouched" not in table
+
+
+def test_a_given_report_that_matches_no_scored_file_warns_naming_it_and_the_table_prints(
+    tmp_path, capsys
+):
+    _write(tmp_path, "project/Demo/Board.fs", "module Demo.Board\n\nlet board x = x + 1\n")
+    _write(
+        tmp_path,
+        "project/reports/other.xml",
+        _one_line_cobertura(str(tmp_path / "checkout/Demo/Board.fs"), 3, 1),
+    )
+
+    code = run(["--root", str(tmp_path / "project"), "--coverage-report", "reports/other.xml"])
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "CRAP Report" in captured.out
+    assert _table_row(captured.out, "board").split()[-2:] == ["N/A", "N/A"]
+    assert (
+        f"--coverage-report {tmp_path / 'project/reports/other.xml'}: matches none of the files being scored"
+        in captured.err
+    )
+    assert "F#: coverage and CRAP show N/A; no coverage report given matches its files." in captured.err
+
+
+def test_a_given_report_does_not_warn_when_the_scored_files_hold_no_function(tmp_path, capsys):
+    _write(tmp_path, "project/Demo/Empty.fs", "module Demo.Empty\n")
+    _write(
+        tmp_path,
+        "project/reports/other.xml",
+        _one_line_cobertura(str(tmp_path / "checkout/Demo/Board.fs"), 3, 1),
+    )
+
+    code = run(["--root", str(tmp_path / "project"), "--coverage-report", "reports/other.xml"])
+
+    assert code == 0
+    assert "matches none of the files being scored" not in capsys.readouterr().err
+
+
+def _cobertura_branch_line(filename: str, condition: str) -> str:
+    return (
+        f'<?xml version="1.0"?><coverage><packages><package name="Demo"><classes>'
+        f'<class name="Demo" filename="{filename}"><methods/><lines>'
+        f'<line number="3" hits="2" branch="True" {condition}/>'
+        f'<line number="4" hits="1" branch="True" {condition}/>'
+        f'<line number="5" hits="0" branch="True" />'
+        "</lines></class></classes></package></packages></coverage>"
+    )
+
+
+def test_a_cobertura_report_with_branch_lines_that_ran_and_no_condition_coverage_warns_once(
+    tmp_path, capsys
+):
+    board = tmp_path / "Demo/Board.fs"
+    _write(tmp_path, "Demo/Board.fs", "module Demo.Board\n\nlet board x =\n    if x then 1\n    else 0\n")
+    _write(tmp_path, "merged/merged.xml", _cobertura_branch_line(str(board), ""))
+    _write(tmp_path, "split/one.xml", _cobertura_branch_line(str(board), 'condition-coverage="50% (1/2)"'))
+
+    merged = run(
+        ["--root", str(tmp_path), "--coverage-report", "merged", "--coverage-report", "merged/merged.xml"]
+    )
+    merged_err = capsys.readouterr().err
+    split = run(["--root", str(tmp_path), "--coverage-report", "split"])
+    split_err = capsys.readouterr().err
+
+    assert merged == 0 and split == 0
+    assert merged_err.count("VSTEST_DISABLE_ARTIFACTS_POSTPROCESSING=1") == 1
+    assert f"{tmp_path / 'merged/merged.xml'}:" in merged_err
+    assert "VSTEST_DISABLE_ARTIFACTS_POSTPROCESSING" not in split_err
+
+
+_FSHARP_BOARD = "module Demo.Board\n\nlet board x = x + 1\n"
+
+
+@pytest.mark.parametrize(
+    ("mode", "hints"),
+    [([], 3), (["--use-existing-coverage"], 3), (["--coverage-command", "make coverage"], 3), (["--no-coverage"], 0)],
+)
+def test_without_a_report_path_fsharp_kotlin_and_swift_show_na_whatever_reports_lie_on_disk(
+    tmp_path, monkeypatch, capsys, mode, hints
+):
+    board = _write(tmp_path, "Demo/Board.fs", _FSHARP_BOARD)
+    _write(tmp_path, "shared/src/commonMain/kotlin/demo/Board.kt", _BOARD_KT)
+    place = _write(tmp_path, "Feature/Sources/Feature/Place.swift", "func place() -> Int { 1 }\n")
+    swift = "target/coverage/swift"
+    reports = [
+        _write(tmp_path, "target/coverage/lcov.info", f"SF:{board}\nDA:3,1\nend_of_record\n"),
+        _write(tmp_path, "target/coverage/fsharp/Demo.Tests/r.cobertura.xml", _one_line_cobertura(str(board), 3, 1)),
+        _write(tmp_path, "build/reports/kover/report.xml", _KOVER_BOARD),
+        _write(tmp_path, "target/site/jacoco/jacoco.xml", _KOVER_BOARD),
+        _write(tmp_path, f"{swift}/lcov.info", f"SF:{place}\nDA:1,1\nend_of_record\n"),
+        _write(tmp_path, f"{swift}/DerivedData/Build/ProfileData/SIM/Coverage.profdata", "profile"),
+        _write(tmp_path, f"{swift}/DerivedData/Build/Products/Debug-iphonesimulator/Shop.app/Shop", "binary"),
+        _write(tmp_path, f"{swift}/Place.json", '{"type": "llvm.coverage.json.export", "data": []}'),
+    ]
+    started = []
+    monkeypatch.setattr("crapper.cli.run_coverage", runners.run_coverage)
+    monkeypatch.setattr("crapper.runners.run_shell", lambda command, cwd: started.append(command) or 0)
+    monkeypatch.setattr(
+        "crapper.languages.swift_coverage.subprocess.run", lambda command, **_kw: started.append(command)
+    )
+
+    code = run(["--root", str(tmp_path), *mode])
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert started == (mode[1:] if mode[0:1] == ["--coverage-command"] else [])
+    for name in ("board", "tick", "clear", "place"):
+        assert _snapshot_coverage(tmp_path, name) == "nil"
+        assert _table_row(captured.out, name).split()[-2:] == ["N/A", "N/A"]
+    assert captured.err.count("--coverage-report <") == hints
+    assert captured.err.count(
+        "F#: coverage and CRAP show N/A; crapper reads F# coverage only from --coverage-report. "
+        "Pass --coverage-report <the Cobertura reports of dotnet test>."
+    ) == (hints > 0)
+    assert captured.err.count(
+        "Kotlin: coverage and CRAP show N/A; crapper reads Kotlin coverage only from --coverage-report. "
+        "Pass --coverage-report <Kover's XML report>."
+    ) == (hints > 0)
+    assert captured.err.count(
+        "Swift: coverage and CRAP show N/A; crapper reads Swift coverage only from --coverage-report. "
+        "Pass --coverage-report <Xcode derived data or a swift test export>."
+    ) == (hints > 0)
+    assert all(report.is_file() for report in reports)
+
+
+def _fake_python_coverage(root: Path, started: list):
+    """Stand in for coverage.py: `coverage run` leaves its data file, `coverage lcov` an LCOV report of app.py."""
+
+    def shell(command, cwd):
+        started.append(command)
+        if command[2:4] == ["coverage", "run"]:
+            Path(command[4].split("=", 1)[1]).write_text("data", encoding="utf-8")
+        if command[2:4] == ["coverage", "lcov"]:
+            report = Path(command[command.index("-o") + 1])
+            report.write_text(f"SF:{root / 'app.py'}\nDA:2,1\nend_of_record\n", encoding="utf-8")
+        return 0
+
+    return shell
+
+
+def test_beside_fsharp_pythons_tests_still_run_and_score_while_fsharp_shows_na(tmp_path, monkeypatch, capsys):
+    _write(tmp_path, "pyproject.toml", "[project]\nname = 'demo'\n")
+    _write(tmp_path, "app.py", "def edited(x):\n    return x\n")
+    _write(tmp_path, "Demo/Board.fs", _FSHARP_BOARD)
+    started = []
+    monkeypatch.setattr("crapper.cli.run_coverage", runners.run_coverage)
+    monkeypatch.setattr("crapper.runners.run_shell", _fake_python_coverage(tmp_path.resolve(), started))
+
+    code = run(["--root", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert any(command[2:4] == ["coverage", "run"] for command in started)
+    assert not any("dotnet" in str(command) for command in started)
+    assert _snapshot_coverage(tmp_path, "edited") == "100.0"
+    assert _snapshot_coverage(tmp_path, "board") == "nil"
+    assert captured.err.count("--coverage-report <") == 1
+    assert "F#: coverage and CRAP show N/A; crapper reads F# coverage only from --coverage-report." in captured.err

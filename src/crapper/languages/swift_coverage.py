@@ -1,24 +1,26 @@
-"""Convert Swift coverage in `target/coverage/swift/` to one LCOV file.
+"""Read Swift coverage from Xcode derived data or `swift test` exports, in memory.
 
-The user's `--coverage-command` runs Xcode's tests with code coverage and its
-derived data inside that folder, as `XCODE_COMMAND` does. Each profile it leaves
+Given by path with `--coverage-report`, derived data anywhere, or one folder
+above it, is read by `read_derived_data`: each profile it holds
 (`Build/ProfileData/<device>/*.profdata`) is read with
 `xcrun llvm-cov export -format=lcov` against the test bundles and apps built
 next to it, which also holds the packages linked into them; `xccov` reports
 those packages as empty. Only the lines `llvm-cov` lists, which are the
-executable ones, are written, because the LCOV loader counts every line it
-is given. Only the Swift files being scored are written, under their absolute
+executable ones, are kept, because the LCOV loader counts every line it is
+given. Only the Swift files being scored are kept, under their absolute
 paths, so a test or third-party file cannot match a source file by suffix. A
-file in several inputs, or in several binaries, is merged line by line, so a
-line is covered when any of them covered it. Without `xcrun`, as on Linux,
-the Xcode inputs are skipped with a warning.
+file in several profiles, or in several binaries, is merged line by line, so
+a line is covered when any of them covered it. A profile that cannot be
+converted, or no `xcrun`, as on Linux, raises `ConversionError`.
 
-A `swift test --enable-code-coverage` run instead leaves a JSON export, which
-the command copies into the folder from the path `swift test
---show-codecov-path` prints, as `PACKAGE_COMMAND` does. Its per-line counts
-are derived from each file's segments the way `llvm-cov` derives its own LCOV
-lines, and merged into the same file; exports need no `xcrun`. A JSON file that is not a coverage export
-is skipped with a warning, and so is an export of an unexpected shape.
+A `swift test --enable-code-coverage` export, under any name, is read by
+`read_export` without `xcrun`. Its per-line counts are derived from each
+file's segments the way `llvm-cov` derives its own LCOV lines; a JSON file
+that is not a coverage export, or an export of an unexpected shape, raises
+ValueError.
+
+Both return each file's line counts and write nothing; the loader adds every
+given input together with `add_counts` and reads `lcov_text`.
 """
 
 from __future__ import annotations
@@ -32,17 +34,6 @@ from pathlib import Path
 
 from crapper.discover import language_of
 
-COVERAGE_DIR = Path("target") / "coverage" / "swift"
-DERIVED_DATA = COVERAGE_DIR / "DerivedData"
-XCODE_COMMAND = (
-    f"rm -rf {COVERAGE_DIR.as_posix()} && xcodebuild test -workspace App.xcworkspace "
-    '-scheme App -destination "platform=iOS Simulator,name=iPhone 17" '
-    f"-enableCodeCoverage YES -derivedDataPath {DERIVED_DATA.as_posix()}"
-)
-PACKAGE_COMMAND = (
-    f"rm -rf {COVERAGE_DIR.as_posix()} && mkdir -p {COVERAGE_DIR.as_posix()} && "
-    f'swift test --enable-code-coverage && cp "$(swift test --show-codecov-path)" {COVERAGE_DIR.as_posix()}/'
-)
 _PROFILES = ("Build/ProfileData/*/*.profdata", "*/Build/ProfileData/*/*.profdata")
 _BINARIES = ("*/*.xctest", "*/*.app", "*/*.app/PlugIns/*.xctest")
 _EXPORT_TYPE = "llvm.coverage.json.export"
@@ -50,14 +41,6 @@ _EXPORT_TYPE = "llvm.coverage.json.export"
 
 def _warn(message: str) -> None:
     print(message, file=sys.stderr)
-
-
-def lcov_path(root: Path) -> Path:
-    return root / COVERAGE_DIR / "lcov.info"
-
-
-def remove_lcov(root: Path) -> None:
-    lcov_path(root).unlink(missing_ok=True)
 
 
 def _scored_sources(files: list[Path]) -> dict[str, str]:
@@ -120,7 +103,11 @@ def _arch_options(binaries: list[Path]) -> list[list[str]]:
     return [[f"-arch={'arm64' if 'arm64' in found else found[0]}"] for found in archs]
 
 
-def _export(profile: Path, binaries: list[Path]) -> str | None:
+class ConversionError(Exception):
+    """Xcode derived data that cannot be converted, with the reason."""
+
+
+def _export(profile: Path, binaries: list[Path]) -> str:
     options = _arch_options(binaries)
     command = [
         "xcrun", "llvm-cov", "export", "-format=lcov", "-skip-functions",
@@ -131,11 +118,9 @@ def _export(profile: Path, binaries: list[Path]) -> str | None:
     try:
         completed = subprocess.run(command, capture_output=True, text=True)
     except OSError as exc:
-        _warn(f"{profile}: llvm-cov failed to start ({exc}); skipped.")
-        return None
+        raise ConversionError(f"{profile}: llvm-cov failed to start ({exc})") from exc
     if completed.returncode != 0:
-        _warn(f"{profile}: llvm-cov exited {completed.returncode} ({completed.stderr.strip()}); skipped.")
-        return None
+        raise ConversionError(f"{profile}: llvm-cov exited {completed.returncode} ({completed.stderr.strip()})")
     return completed.stdout
 
 
@@ -185,15 +170,15 @@ def _line_counts(segments: list) -> dict[int, int]:
     return counts
 
 
-def _merge_export(merged: dict[str, dict[int, int]], export: Path, sources: dict[str, str]) -> None:
+def _export_counts(export: Path, sources: dict[str, str]) -> dict[str, dict[int, int]]:
+    """The scored files' line counts in a `swift test` export; ValueError when it is not one."""
+
     try:
         data = json.loads(export.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, ValueError) as exc:
-        _warn(f"{export}: not a swift test coverage export ({exc}); skipped.")
-        return
+        raise ValueError(f"not a swift test coverage export ({exc})") from exc
     if not isinstance(data, dict) or data.get("type") != _EXPORT_TYPE:
-        _warn(f"{export}: not a swift test coverage export (no type {_EXPORT_TYPE}); skipped.")
-        return
+        raise ValueError(f"not a swift test coverage export (no type {_EXPORT_TYPE})")
     read: dict[str, dict[int, int]] = {}
     try:
         for unit in data.get("data", []):
@@ -204,15 +189,20 @@ def _merge_export(merged: dict[str, dict[int, int]], export: Path, sources: dict
                 for number, hits in _line_counts(file.get("segments", [])).items():
                     counts[number] = counts.get(number, 0) + hits
     except (AttributeError, IndexError, KeyError, TypeError) as exc:
-        _warn(f"{export}: not a swift test coverage export ({exc!r}); skipped.")
-        return
+        raise ValueError(f"not a swift test coverage export ({exc!r})") from exc
+    return read
+
+
+def add_counts(merged: dict[str, dict[int, int]], read: dict[str, dict[int, int]]) -> None:
+    """Add one input's line counts to `merged`, so a line is covered when any input covered it."""
+
     for source, counts in read.items():
         target = merged.setdefault(source, {})
         for number, hits in counts.items():
             target[number] = target.get(number, 0) + hits
 
 
-def _lcov_text(merged: dict[str, dict[int, int]]) -> str:
+def lcov_text(merged: dict[str, dict[int, int]]) -> str:
     records = []
     for source in sorted(merged):
         counts = merged[source]
@@ -221,41 +211,41 @@ def _lcov_text(merged: dict[str, dict[int, int]]) -> str:
     return "\n".join(records) + "\n"
 
 
+def _profile_lcov(profile: Path) -> str:
+    binaries = _binaries(profile)
+    if not binaries:
+        raise ConversionError(f"{profile}: no test bundle or app next to it")
+    return _export(profile, binaries)
+
+
 def _merge_profiles(merged: dict[str, dict[int, int]], profiles: list[Path], sources: dict[str, str]) -> None:
+    """Merge each profile's lines; raises ConversionError when one cannot be converted."""
+
     if shutil.which("xcrun") is None:
         names = ", ".join(str(profile) for profile in profiles)
-        _warn(f"xcrun is not installed; skipping the Xcode coverage profiles {names}.")
-        return
+        raise ConversionError(f"xcrun is not installed, so the Xcode coverage profiles {names} cannot be read")
     for profile in profiles:
-        binaries = _binaries(profile)
-        if not binaries:
-            _warn(f"{profile}: no test bundle or app next to it; skipped.")
-            continue
-        text = _export(profile, binaries)
-        if text is not None:
-            _merge_lcov(merged, text, sources)
+        _merge_lcov(merged, _profile_lcov(profile), sources)
 
 
-def convert(root: Path, files: list[Path]) -> None:
-    """Replace `target/coverage/swift/lcov.info` with what the profiles and exports record."""
+def is_derived_data(folder: Path) -> bool:
+    """Whether `folder`, or a folder directly inside it, is Xcode derived data with a profile."""
 
-    folder = root / COVERAGE_DIR
-    remove_lcov(root)
-    profiles = _profiles(folder) if folder.is_dir() else []
-    exports = sorted(folder.glob("*.json")) if folder.is_dir() else []
-    if not profiles and not exports:
-        _warn(
-            f"No Xcode coverage profile (Build/ProfileData/*/*.profdata) and no swift test "
-            f"export (*.json) in {folder}. Pass -derivedDataPath {DERIVED_DATA.as_posix()} "
-            "to xcodebuild, or copy the file swift test --show-codecov-path prints there. "
-            "Swift coverage will score 0%."
-        )
-        return
-    sources = _scored_sources(files)
+    return folder.is_dir() and bool(_profiles(folder))
+
+
+def read_derived_data(folder: Path, files: list[Path]) -> dict[str, dict[int, int]]:
+    """Each scored file's line counts in the derived data at `folder`, or one folder down.
+
+    Nothing is written. Raises ConversionError when a profile cannot be converted.
+    """
+
     merged: dict[str, dict[int, int]] = {}
-    if profiles:
-        _merge_profiles(merged, profiles, sources)
-    for export in exports:
-        _merge_export(merged, export, sources)
-    if merged:
-        lcov_path(root).write_text(_lcov_text(merged), encoding="utf-8")
+    _merge_profiles(merged, _profiles(folder), _scored_sources(files))
+    return merged
+
+
+def read_export(export: Path, files: list[Path]) -> dict[str, dict[int, int]]:
+    """Each scored file's line counts in a `swift test` export; ValueError when it is not one."""
+
+    return _export_counts(export, _scored_sources(files))

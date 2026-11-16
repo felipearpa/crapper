@@ -2,17 +2,19 @@
 
 Clojure prefers Cloverage's per-line form counts, then LCOV. Java uses JaCoCo
 instruction counters, and Kotlin the same counters from Kover's JaCoCo-shaped
-report. Go uses statement profiles. Cobertura reports join the
-LCOV index. LCOV scores a function by its BRDA branch records when it has any,
-and by line hits otherwise. Swift's LCOV is converted from Xcode profile data
-or `swift test` exports by `crapper.languages.swift_coverage` before the loader runs.
+report. Go uses statement profiles. Cobertura reports join the LCOV index;
+they and Kover's report are read only from paths given to `load_reports`.
+LCOV scores a function by its BRDA branch records when it has any, and by
+line hits otherwise. Swift's LCOV is converted in memory from Xcode profile
+data or `swift test` exports given to `load_reports`, by
+`crapper.languages.swift_coverage`. F#, Kotlin, and Swift are scored from
+given paths only (`GIVEN_ONLY`).
 `percent_for` returns None when the file is absent; analysis turns that into 0%.
 """
 
 from __future__ import annotations
 
 import functools
-import os
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -20,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from urllib.parse import unquote
 
+from crapper.languages import swift_coverage
 from crapper.model import Function
 from crapper.runners import nearest_marker
 
@@ -418,10 +421,16 @@ def _merge_line(
     record.branches[number] = (max(current[0], branch[0]), max(current[1], branch[1]))
 
 
-def parse_cobertura(text: str, root: Path) -> dict[str, FileCoverage]:
-    """Key files by their path relative to `root`; classes that name one file merge."""
+def read_cobertura(text: str, root: Path) -> tuple[dict[str, FileCoverage], bool]:
+    """Files keyed by their path relative to `root`, classes that name one file
+    merged, and whether a branch line that ran has no `condition-coverage`.
+
+    A solution-wide `dotnet test` merges its test projects' reports and drops
+    that value on lines more than one project reached.
+    """
 
     found: dict[str, FileCoverage] = {}
+    lacking = False
     for class_node in ET.fromstring(text.lstrip("\ufeff")).iter("class"):
         key = _cobertura_key(class_node.get("filename", ""), root)
         if key is None:
@@ -430,8 +439,11 @@ def parse_cobertura(text: str, root: Path) -> dict[str, FileCoverage]:
         for line in class_node.iter("line"):
             number = int(line.get("number") or "0")
             covered = 1 if int(line.get("hits") or "0") > 0 else 0
-            _merge_line(record, number, covered, _condition_coverage(line))
-    return found
+            branch = _condition_coverage(line)
+            if branch is None and covered and line.get("branch", "").lower() == "true":
+                lacking = True
+            _merge_line(record, number, covered, branch)
+    return found, lacking
 
 
 @dataclass
@@ -533,6 +545,10 @@ def parse_jacoco_index(text: str) -> dict[str, list[JacocoMethod]]:
     return found
 
 
+# Languages that get coverage only from paths given with `--coverage-report`.
+GIVEN_ONLY = frozenset({"fsharp", "kotlin", "swift"})
+
+
 @dataclass
 class CoverageBundle:
     lcov: dict[str, dict[int, tuple[int, int]]] = field(default_factory=dict)
@@ -541,6 +557,9 @@ class CoverageBundle:
     form_html: dict[str, dict[int, tuple[int, int]]] = field(default_factory=dict)
     source_parts: list[tuple[str, ...]] = field(default_factory=list)
     root: Path | None = None
+    # Each path given with `--coverage-report` and the reports it holds; None
+    # when coverage came from crapper's own locations.
+    given: list[tuple[Path, CoverageBundle]] | None = None
 
     def bind_sources(self, paths: list[str]) -> None:
         """Remember project files so a short path cannot take a longer file's report."""
@@ -554,6 +573,8 @@ class CoverageBundle:
                     seen.add(parts)
                     found.append(parts)
         self.source_parts = found
+        for _, reports in self.given or []:
+            reports.source_parts = found
 
     def percent_for(self, function: Function) -> float | None:
         if function.language == "kotlin" and function.jacoco_class:
@@ -580,6 +601,42 @@ class CoverageBundle:
         if branched is not None:
             return branched
         return percent_for_range(record, function.start_line, function.end_line)
+
+    def knows(self, function: Function) -> bool:
+        """Whether a report holds the function's file, or for Java and Kotlin one of its classes."""
+
+        if function.language == "kotlin" and function.jacoco_class:
+            return function.jacoco_class in self._jacoco_by_class
+        if function.language == "java":
+            return any(name in self._jacoco_by_class for name in (function.jacoco_class, function.namespace))
+        if function.language == "go":
+            return self._go_segments(function.path) is not None
+        return self._html_lines(function.path) is not None or self._lcov_lines(function.path) is not None
+
+    def given_languages(self, functions: list[Function]) -> set[str]:
+        """Languages whose functions are looked up in the reports.
+
+        With paths given, those with a scored file in the given reports; with
+        none, every language of `functions` but the ones in `GIVEN_ONLY`.
+
+        Warns, naming it, for each given path whose reports hold none of the
+        scored files, when there are functions to score.
+        """
+
+        if self.given is None:
+            return {function.language for function in functions} - GIVEN_ONLY
+        for path, reports in self.given if functions else []:
+            if not any(reports.knows(function) for function in functions):
+                print(
+                    f"--coverage-report {path}: matches none of the files being scored; "
+                    "was it made in another checkout or for another project?",
+                    file=sys.stderr,
+                )
+        found: set[str] = set()
+        for function in functions:
+            if function.language not in found and self.knows(function):
+                found.add(function.language)
+        return found
 
     @functools.cached_property
     def _jacoco_by_class(self) -> dict[str, list[tuple[str, JacocoMethod]]]:
@@ -618,27 +675,8 @@ def _read(path: Path) -> str | None:
     return path.read_text(encoding="utf-8", errors="replace")
 
 
-# Swift's coverage folder holds Xcode's derived data, a large tree whose own
-# files are not reports; only the LCOV file the converter writes at its top
-# is read.
-_SWIFT_COVERAGE_DIR = "swift"
-
-
-def _coverage_files(coverage_dir: Path, wanted) -> list[Path]:
-    """Files under `target/coverage` whose name is `wanted`, not below the Swift folder."""
-
-    swift = coverage_dir / _SWIFT_COVERAGE_DIR
-    found: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(coverage_dir):
-        folder = Path(dirpath)
-        if folder == swift:
-            dirnames.clear()
-        found.extend(folder / name for name in filenames if wanted(name))
-    return found
-
-
 def _lcov_paths(root: Path) -> list[Path]:
-    paths = _coverage_files(root / "target" / "coverage", lambda name: name == "lcov.info")
+    paths = list(root.glob("target/coverage/**/lcov.info"))
     paths.extend(root.glob("coverage/**/lcov.info"))
     return paths
 
@@ -683,9 +721,6 @@ def _merge_jacoco(root: Path) -> dict[str, list[JacocoMethod]]:
     paths = [root / "target" / "site" / "jacoco" / "jacoco.xml"]
     paths.extend(root.glob("*/target/site/jacoco/jacoco.xml"))
     paths.extend(root.glob("*/*/target/site/jacoco/jacoco.xml"))
-    paths.append(root / "build/reports/kover/report.xml")
-    paths.extend(root.glob("*/build/reports/kover/report.xml"))
-    paths.extend(root.glob("*/*/build/reports/kover/report.xml"))
     merged: dict[str, list[JacocoMethod]] = {}
     for text in _merge_texts(paths):
         for key, methods in parse_jacoco_index(text).items():
@@ -693,27 +728,11 @@ def _merge_jacoco(root: Path) -> dict[str, list[JacocoMethod]]:
     return merged
 
 
-def _merge_cobertura(root: Path) -> dict[str, FileCoverage]:
-    """Merge reports file by file, as one report merges its classes.
-
-    Cobertura gives only a count per line, so two reports that took different
-    branches of one line under-count it. An unreadable report is skipped with
-    a warning, so the other reports still score.
-    """
-
-    resolved = root.resolve()
-    merged: dict[str, FileCoverage] = {}
-    for path in sorted((root / "target" / "coverage" / "fsharp").rglob("*.cobertura.xml")):
-        try:
-            parsed = parse_cobertura(path.read_text(encoding="utf-8", errors="replace"), resolved)
-        except (ET.ParseError, OSError, ValueError) as exc:
-            print(f"{path}: unreadable Cobertura report ({exc}); skipped.", file=sys.stderr)
-            continue
-        for key, record in parsed.items():
-            into = merged.setdefault(key, FileCoverage())
-            for number, (covered, _total) in record.items():
-                _merge_line(into, number, covered, record.branches.get(number))
-    return merged
+def _add_cobertura(merged: dict[str, FileCoverage], parsed: dict[str, FileCoverage]) -> None:
+    for key, record in parsed.items():
+        into = merged.setdefault(key, FileCoverage())
+        for number, (covered, _total) in record.items():
+            _merge_line(into, number, covered, record.branches.get(number))
 
 
 def _merge_forms(root: Path) -> dict[str, dict[int, tuple[int, int]]]:
@@ -721,7 +740,7 @@ def _merge_forms(root: Path) -> dict[str, dict[int, tuple[int, int]]]:
     found: dict[str, dict[int, tuple[int, int]]] = {}
     if not coverage_dir.is_dir():
         return found
-    for html_path in _coverage_files(coverage_dir, lambda name: name.endswith(".html")):
+    for html_path in coverage_dir.rglob("*.html"):
         text = _read(html_path)
         if not text or "forms covered" not in text:
             continue
@@ -732,12 +751,11 @@ def _merge_forms(root: Path) -> dict[str, dict[int, tuple[int, int]]]:
 
 
 def load_bundle(root: Path) -> CoverageBundle:
-    """The Cobertura reports of a file win over an LCOV record of that file."""
+    """Coverage from crapper's own locations, which hold no F# or Kotlin report."""
 
     go_profile = _merge_go(root)
     jacoco = _merge_jacoco(root)
     lcov = _merge_lcov(root)
-    lcov.update(_merge_cobertura(root))
     return CoverageBundle(
         lcov=lcov,
         go_profile=go_profile or None,
@@ -745,3 +763,193 @@ def load_bundle(root: Path) -> CoverageBundle:
         form_html=_merge_forms(root),
         root=root,
     )
+
+
+class ReportPathError(Exception):
+    """A path given with `--coverage-report` holds no report crapper reads."""
+
+
+_XML_PROLOG = re.compile(r"\s*(?:<\?.*?\?>|<!--.*?-->|<!DOCTYPE[^>]*>|\s)*<([\w.:-]+)", re.DOTALL)
+_LCOV_SOURCE = re.compile(r"^\s*SF:", re.MULTILINE)
+_HEAD_BYTES = 4096
+_SWIFT_EXPORT = re.compile(r'"type"\s*:\s*"llvm\.coverage\.json\.export"')
+_SWIFT_EXPORT_HEAD = re.compile(r'\s*\{\s*"data"\s*:\s*\[\s*\{\s*"files"\s*:\s*\[')
+_XML_ROOTS = {"coverage": "cobertura", "report": "jacoco"}
+_LABELS = {
+    "cobertura": "Cobertura",
+    "jacoco": "JaCoCo or Kover",
+    "lcov": "LCOV",
+    "go": "Go",
+    "swift": "swift test coverage",
+}
+_KNOWN = "Xcode derived data, Cobertura, JaCoCo or Kover XML, LCOV, Go profile, swift test export"
+
+
+def _tail(path: Path) -> str:
+    """The last bytes of a file: a `swift test` export names its type at its end."""
+
+    with path.open("rb") as handle:
+        handle.seek(max(0, path.stat().st_size - _HEAD_BYTES))
+        return handle.read().decode("utf-8", errors="replace")
+
+
+def _report_format(path: Path) -> str | None:
+    """The report format of a file, told from its first bytes, or a JSON file's last, not its name."""
+
+    try:
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            head = handle.read(_HEAD_BYTES).lstrip("\ufeff")
+        tail = _tail(path) if head.lstrip().startswith("{") else ""
+    except OSError:
+        return None
+    root_tag = _XML_PROLOG.match(head)
+    if root_tag is not None:
+        return _XML_ROOTS.get(root_tag.group(1))
+    if _LCOV_SOURCE.search(head):
+        return "lcov"
+    if head.lstrip().startswith("mode:"):
+        return "go"
+    if _SWIFT_EXPORT_HEAD.match(head) or (tail and _SWIFT_EXPORT.search(head + tail)):
+        return "swift"
+    return None
+
+
+def _given_files(path: Path) -> list[Path]:
+    if path.is_dir():
+        return sorted(found for found in path.rglob("*") if found.is_file())
+    return [path]
+
+
+def _parse_report(kind: str, path: Path, root: Path, files: list[Path]):
+    if kind == "swift":
+        return swift_coverage.read_export(path, files)
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if kind == "cobertura":
+        parsed, lacking = read_cobertura(text, root)
+        if lacking:
+            print(
+                f"{path}: Cobertura report with branch lines that ran and carry no condition-coverage, "
+                "as a solution-wide dotnet test leaves when it merges its test projects' reports; "
+                "their functions may score wrongly. Run dotnet test with "
+                "VSTEST_DISABLE_ARTIFACTS_POSTPROCESSING=1 to keep one report per test project.",
+                file=sys.stderr,
+            )
+        return parsed
+    if kind == "jacoco":
+        return parse_jacoco_index(text)
+    if kind == "lcov":
+        return parse_lcov(text)
+    return parse_go_profile(text)
+
+
+def _read_derived_data(path: Path, read: dict[Path, tuple[str, object] | str], files: list[Path]) -> None:
+    """Convert Xcode derived data without searching it: its package checkouts hold report-like fixtures."""
+
+    real = path.resolve()
+    if real in read:
+        return
+    try:
+        read[real] = ("swift", swift_coverage.read_derived_data(path, files))
+    except swift_coverage.ConversionError as exc:
+        raise ReportPathError(f"--coverage-report {path}: cannot convert Xcode derived data: {exc}.") from exc
+
+
+def _read_given(
+    path: Path, root: Path, read: dict[Path, tuple[str, object] | str], files: list[Path]
+) -> list[Path]:
+    """Read the reports at one given path into `read`, keyed by real path, each once.
+
+    A damaged report is kept as its message. Named directly it stops crapper,
+    also when a folder reached it first; inside a folder it is skipped with a
+    warning. Returns the real paths of the reports the path holds that could
+    be read.
+    """
+
+    if swift_coverage.is_derived_data(path):
+        _read_derived_data(path, read, files)
+        return [path.resolve()]
+    reached: list[Path] = []
+    for file in _given_files(path):
+        real = file.resolve()
+        if real not in read:
+            kind = _report_format(file)
+            if kind is None:
+                continue
+            try:
+                read[real] = (kind, _parse_report(kind, file, root, files))
+            except (ET.ParseError, OSError, ValueError) as exc:
+                read[real] = f"{file}: unreadable {_LABELS[kind]} report ({exc})"
+                if file != path:
+                    print(f"{read[real]}; skipped.", file=sys.stderr)
+        if isinstance(read[real], str) and file == path:
+            raise ReportPathError(f"--coverage-report {read[real]}.")
+        if not isinstance(read[real], str):
+            reached.append(real)
+    return reached
+
+
+def _given_reports(
+    root: Path, given: list[str], files: list[Path]
+) -> tuple[dict[Path, tuple[str, object]], list[tuple[Path, list[Path]]]]:
+    """Parsed reports by real path, in the order they were reached, and each given path
+    with the real paths of its reports. A relative path is read inside `root`."""
+
+    read: dict[Path, tuple[str, object] | str] = {}
+    reached: list[tuple[Path, list[Path]]] = []
+    for raw in given:
+        path = Path(raw) if Path(raw).is_absolute() else root / raw
+        if not path.exists():
+            raise ReportPathError(f"--coverage-report {path}: no such file or folder.")
+        found = _read_given(path, root.resolve(), read, files)
+        if not found:
+            raise ReportPathError(
+                f"--coverage-report {path}: holds no coverage report crapper reads ({_KNOWN})."
+            )
+        reached.append((path, found))
+    reports = {real: report for real, report in read.items() if not isinstance(report, str)}
+    return reports, reached
+
+
+def load_reports(root: Path, given: list[str], files: list[Path]) -> CoverageBundle:
+    """Coverage from the given report paths only, never from crapper's own locations.
+
+    The bundle also keeps each given path with its own reports, so a path
+    that matches no scored file can be named.
+
+    Xcode derived data and `swift test` exports are converted in memory for the
+    Swift files among `files` and added together line by line, whatever their
+    order, as the conversion after a coverage command adds them; the sum is read
+    as one LCOV report.
+
+    Reports combine Cobertura line by line, the last LCOV record of a file wins,
+    JaCoCo methods and Go segments add up, and a Cobertura record of a file wins
+    over an LCOV record of it.
+    """
+
+    reports, reached = _given_reports(root, given, files)
+    bundle = _combine(list(reports.values()), root)
+    bundle.given = [(path, _combine([reports[real] for real in found], root)) for path, found in reached]
+    return bundle
+
+
+def _combine(reports: list[tuple[str, object]], root: Path) -> CoverageBundle:
+    lcov: dict[str, FileCoverage] = {}
+    cobertura: dict[str, FileCoverage] = {}
+    jacoco: dict[str, list[JacocoMethod]] = {}
+    go_profile: dict[str, list[tuple[int, int, int, int]]] = {}
+    swift: dict[str, dict[int, int]] = {}
+    for kind, parsed in reports:
+        if kind == "cobertura":
+            _add_cobertura(cobertura, parsed)
+        elif kind == "swift":
+            swift_coverage.add_counts(swift, parsed)
+        elif kind == "lcov":
+            lcov.update(parsed)
+        else:
+            into = jacoco if kind == "jacoco" else go_profile
+            for key, values in parsed.items():
+                into.setdefault(key, []).extend(values)
+    if swift:
+        lcov.update(parse_lcov(swift_coverage.lcov_text(swift)))
+    lcov.update(cobertura)
+    return CoverageBundle(lcov=lcov, go_profile=go_profile or None, jacoco=jacoco or None, root=root)
